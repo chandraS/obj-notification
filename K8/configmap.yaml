@@ -5,68 +5,67 @@ metadata:
   namespace: object-monitor
 data:
   config.yaml: |
-    # Global defaults
     # Linode Object Storage Monitor Configuration
 
-# Global defaults
-defaults:
-  polling_interval: 60  # Scan interval in seconds
-  endpoint: "us-east-1.linodeobjects.com"  # Default region
-  max_objects_per_batch: 1000  # Maximum objects to process per bucket scan
+    # Global defaults
+    defaults:
+      polling_interval: 60  # Scan interval in seconds
+      endpoint: "us-east-1.linodeobjects.com"  # Default region
+      max_objects_per_batch: 1000  # Maximum objects to process per bucket scan
 
-# Thread pool configuration
-parallel:
-  max_workers: 60  # Main thread pool size
-  rate_limit_per_region: 15  # Max concurrent operations per region
-  buckets_per_batch: 10  # Number of buckets to process in parallel
-  stagger_method: "hash"  # Use hash-based staggering for even distribution
+    # Thread pool configuration
+    parallel:
+      max_workers: 60  # Main thread pool size
+      rate_limit_per_region: 15  # Max concurrent operations per region
+      buckets_per_batch: 10  # Number of buckets to process in parallel
+      stagger_method: "hash"  # Use hash-based staggering for even distribution
 
-# Redis configuration with Sentinel support
-redis:
-  # Sentinel configuration
-  sentinel_host: "redis-sentinel"  # Sentinel service
-  sentinel_port: 26379
-  master_name: "mymaster"
-  
-  # Fallback direct connection (used if Sentinel is unavailable)
-  host: "redis-0.redis"
-  port: 6379
-  
-  # Common Redis settings
-  db: 0
-  password: null  # Set password if Redis requires authentication
-  
-  # Application-specific Redis keys
-  queue_name: "linode:notifications:queue"
-  state_prefix: "linode:objstore:state:"
-  ttl: 2592000  # 30-day state TTL (in seconds)
-  
-  # Connection pool settings
-  connection_pool_size: 20
-  socket_timeout: 5.0
-  socket_connect_timeout: 5.0
+    # Redis configuration with Sentinel support
+    redis:
+      # Sentinel configuration
+      sentinel_host: "redis-sentinel"  # Sentinel service
+      sentinel_port: 26379
+      master_name: "mymaster"
+      
+      # Fallback direct connection (used if Sentinel is unavailable)
+      host: "redis-0.redis"
+      port: 6379
+      
+      # Common Redis settings
+      db: 0
+      password: null  # Set password if Redis requires authentication
+      
+      # Application-specific Redis keys
+      queue_name: "linode:notifications:queue"
+      state_prefix: "linode:objstore:state:"
+      ttl: 2592000  # 30-day state TTL (in seconds)
+      
+      # Connection pool settings
+      connection_pool_size: 20
+      socket_timeout: 5.0
+      socket_connect_timeout: 5.0
 
-# Webhook settings
-webhook:
-  url: "https://webhook.example.com/endpoint"  # Replace with your webhook endpoint
-  timeout: 10  # Request timeout in seconds
-  max_retries: 3  # Maximum retry attempts for failed deliveries
-  backoff_factor: 2  # Exponential backoff factor between retries
-  circuit_threshold: 5  # Number of failures before circuit opens
-  circuit_reset_time: 60  # Seconds to wait before trying circuit reset
+    # Webhook settings
+    webhook:
+      url: "https://webhook.example.com/endpoint"  # Replace with your webhook endpoint
+      timeout: 10  # Request timeout in seconds
+      max_retries: 3  # Maximum retry attempts for failed deliveries
+      backoff_factor: 2  # Exponential backoff factor between retries
+      circuit_threshold: 5  # Number of failures before circuit opens
+      circuit_reset_time: 60  # Seconds to wait before trying circuit reset
 
-# Consumer settings
-consumer:
-  polling_interval: 1  # Queue check interval in seconds
-  batch_size: 10  # Process up to 10 messages at once
-  webhook_threads: 20  # Concurrent webhook delivery threads
-  max_empty_polls: 10  # Number of empty polls before backoff
+    # Consumer settings
+    consumer:
+      polling_interval: 1  # Queue check interval in seconds
+      batch_size: 10  # Process up to 10 messages at once
+      webhook_threads: 20  # Concurrent webhook delivery threads
+      max_empty_polls: 10  # Number of empty polls before backoff
 
-# Logging settings
-logging:
-  level: "INFO"  # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "monitor.log"  # Log file name (null for console only)
+    # Logging settings
+    logging:
+      level: "INFO"  # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+      file: "monitor.log"  # Log file name (null for console only)
 
-# Buckets are loaded from separate secret file
-buckets: []
+    # Buckets are loaded from separate secret file
+    buckets: []
