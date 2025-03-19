@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bucket-monitor
+  namespace: object-monitor
+  labels:
+    app: bucket-monitor
+spec:
+  replicas: 3  # Start with 3 replicas, let HPA adjust
+  selector:
+    matchLabels:
+      app: bucket-monitor
+  template:
+    metadata:
+      labels:
+        app: bucket-monitor
+    spec:
+      containers:
+      - name: bucket-monitor
+        image: ${YOUR_REGISTRY}/bucket-monitor:latest  # Replace with your image
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: "4"  # Requesting 4 CPU cores
+            memory: "8Gi"  # Requesting 8GB RAM
+          limits:
+            cpu: "8"  # Limit to 8 CPU cores
+            memory: "16Gi"  # Limit to 16GB RAM
+        env:
+        - name: POLLING_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: monitor-config
+              key: polling_interval
+              optional: true
+        - name: REDIS_HOST
+          value: "redis"
+        - name: LOG_LEVEL
+          value: "INFO"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: secrets-volume
+          mountPath: /app/secrets
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config-volume
+        configMap:
+          name: monitor-config
+      - name: secrets-volume
+        secret:
+          secretName: bucket-secrets
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: bucket-monitor-hpa
+  namespace: object-monitor
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bucket-monitor
+  minReplicas: 3
+  maxReplicas: 5  # Match your node count
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
