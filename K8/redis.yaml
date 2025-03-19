@@ -1,18 +1,4 @@
 apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-  namespace: object-monitor
-  labels:
-    app: redis
-spec:
-  ports:
-  - port: 6379
-    name: redis
-  selector:
-    app: redis
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: redis-config
@@ -26,6 +12,44 @@ data:
     tcp-keepalive 60
     timeout 300
     io-threads 4
+    
+  sentinel.conf: |
+    port 26379
+    sentinel monitor mymaster redis-0.redis 6379 2
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 60000
+    sentinel parallel-syncs mymaster 1
+    protected-mode no
+    
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: object-monitor
+  labels:
+    app: redis
+spec:
+  ports:
+  - port: 6379
+    name: redis
+  clusterIP: None  # Headless service for StatefulSet
+  selector:
+    app: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: object-monitor
+  labels:
+    app: redis
+spec:
+  ports:
+  - port: 26379
+    name: sentinel
+  selector:
+    app: redis
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -34,7 +58,7 @@ metadata:
   namespace: object-monitor
 spec:
   serviceName: "redis"
-  replicas: 1
+  replicas: 3  # 3 Redis nodes, each with a Sentinel sidecar
   selector:
     matchLabels:
       app: redis
@@ -43,10 +67,37 @@ spec:
       labels:
         app: redis
     spec:
+      initContainers:
+      - name: init-redis
+        image: redis:7.0-alpine
+        command: ['/bin/sh', '-c']
+        args:
+          - |
+            set -ex
+            # Generate the proper redis.conf for this instance
+            cp /mnt/config/redis.conf /etc/redis/redis.conf
+            
+            # Configure replication for non-master instances
+            if [ "$(hostname)" != "redis-0" ]; then
+              echo "replicaof redis-0.redis 6379" >> /etc/redis/redis.conf
+            fi
+            
+            # Copy sentinel config
+            cp /mnt/config/sentinel.conf /etc/redis/sentinel.conf
+            
+            # Update sentinel configuration with pod-specific info
+            echo "sentinel announce-ip $(hostname).redis" >> /etc/redis/sentinel.conf
+            echo "sentinel announce-port 26379" >> /etc/redis/sentinel.conf
+            
+        volumeMounts:
+        - name: redis-config
+          mountPath: /mnt/config
+        - name: config
+          mountPath: /etc/redis
       containers:
       - name: redis
         image: redis:7.0-alpine
-        args: ["--include", "/etc/redis/redis.conf"]
+        command: ["redis-server", "/etc/redis/redis.conf"]
         resources:
           requests:
             cpu: "2"
@@ -60,7 +111,7 @@ spec:
         volumeMounts:
         - name: redis-data
           mountPath: /data
-        - name: redis-config
+        - name: config
           mountPath: /etc/redis
         livenessProbe:
           exec:
@@ -76,10 +127,48 @@ spec:
             - ping
           initialDelaySeconds: 5
           timeoutSeconds: 1
+      - name: sentinel
+        image: redis:7.0-alpine
+        command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
+        resources:
+          requests:
+            cpu: "0.1"
+            memory: "256Mi"
+          limits:
+            cpu: "0.2"
+            memory: "512Mi"
+        ports:
+        - containerPort: 26379
+          name: sentinel
+        volumeMounts:
+        - name: config
+          mountPath: /etc/redis
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - sentinel
+            - master
+            - mymaster
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
       volumes:
       - name: redis-config
         configMap:
           name: redis-config
+      - name: config
+        emptyDir: {}
   volumeClaimTemplates:
   - metadata:
       name: redis-data
