@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: monitor-config
+  namespace: object-monitor
+data:
+  config.yaml: |
+    # Global defaults
+    defaults:
+      polling_interval: 60  # Set your desired interval (60 seconds)
+      endpoint: "us-east-1.linodeobjects.com"  # Default region
+      max_objects_per_batch: 1000
+    
+    # Thread pool configuration
+    parallel:
+      max_workers: 60  # Main thread pool (adjust based on your interval)
+      rate_limit_per_region: 15  # Per-region concurrency limit
+      buckets_per_batch: 10
+      stagger_method: "hash"  # Use hash-based staggering
+    
+    # Redis configuration
+    redis:
+      host: "redis"
+      port: 6379
+      db: 0
+      password: null
+      queue_name: "linode:notifications:queue"
+      state_prefix: "linode:objstore:state:"
+      ttl: 2592000  # 30-day state TTL
+    
+    # Webhook settings
+    webhook:
+      url: "YOUR_WEBHOOK_URL"  # Replace with your webhook endpoint
+      timeout: 10
+      max_retries: 3
+      backoff_factor: 2
+      circuit_threshold: 5
+      circuit_reset_time: 60
+    
+    # Consumer settings
+    consumer:
+      polling_interval: 1
+      batch_size: 10
+      webhook_threads: 20
+    
+    # Buckets to monitor - will be replaced by bucket-secret
+    buckets: []
