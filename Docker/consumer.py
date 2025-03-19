@@ -5,6 +5,8 @@ Webhook Consumer for Linode Object Storage Monitor
 This script reads notifications from the Redis queue and
 delivers them to the configured webhook endpoint.
 It handles retries, circuit breaking, and rate limiting.
+
+Supports Redis Sentinel for high availability.
 """
 
 import json
@@ -25,7 +27,8 @@ from utils import (
     create_redis_client,
     get_notifications,
     check_redis_health,
-    check_queue_stats
+    check_queue_stats,
+    check_sentinel_health
 )
 
 # Set up logging
@@ -105,6 +108,7 @@ class WebhookConsumer:
         self.polling_interval = consumer_config.get("polling_interval", 1)
         self.batch_size = consumer_config.get("batch_size", 10)
         self.webhook_threads = consumer_config.get("webhook_threads", 20)
+        self.max_empty_polls = consumer_config.get("max_empty_polls", 10)
         
         # Track statistics
         self.stats = {
@@ -121,6 +125,13 @@ class WebhookConsumer:
         
         # Start health check server
         self.start_health_server()
+        
+        # Check Redis Sentinel status
+        sentinel_status = check_sentinel_health(self.config)
+        if sentinel_status["status"] == "ok":
+            logger.info(f"Redis Sentinel active: Master at {sentinel_status.get('master')}, {sentinel_status.get('slave_count')} slaves")
+        else:
+            logger.warning(f"Redis Sentinel not available: {sentinel_status.get('error')}")
     
     def deliver_webhook(self, message):
         """Send a notification to the webhook with circuit breaker pattern."""
@@ -235,14 +246,16 @@ class WebhookConsumer:
                     self2.wfile.write(json.dumps(health_status).encode())
                     
                 elif self2.path == '/ready':
-                    # Check if Redis is available and webhook URL is configured
+                    # Check if Redis is available, Sentinel is available, and webhook URL is configured
                     redis_ok = check_redis_health(self.redis_client)
+                    sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
                     webhook_ok = self.webhook_url is not None
                     
-                    status_code = 200 if (redis_ok and webhook_ok) else 503
+                    status_code = 200 if (redis_ok and webhook_ok and sentinel_ok) else 503
                     ready_status = {
-                        "status": "ready" if (redis_ok and webhook_ok) else "not_ready",
+                        "status": "ready" if (redis_ok and webhook_ok and sentinel_ok) else "not_ready",
                         "redis": "ok" if redis_ok else "error",
+                        "sentinel": "ok" if sentinel_ok else "error",
                         "webhook": "ok" if webhook_ok else "missing"
                     }
                     self2.send_response(status_code)
@@ -254,10 +267,12 @@ class WebhookConsumer:
                     # Return current metrics
                     uptime = time.time() - self.stats["start_time"]
                     queue_stats = check_queue_stats(self.redis_client, self.config)
+                    sentinel_stats = check_sentinel_health(self.config)
                     
                     metrics = {
                         "consumer_stats": self.stats,
                         "queue": queue_stats,
+                        "sentinel": sentinel_stats,
                         "uptime_seconds": uptime,
                         "circuit_breaker": {
                             "state": self.circuit_breaker.state,
@@ -304,7 +319,7 @@ class WebhookConsumer:
                     empty_polls += 1
                     # Exponential backoff for empty polls to reduce Redis load
                     sleep_time = min(
-                        self.polling_interval * (2 if empty_polls > 10 else 1),
+                        self.polling_interval * (2 if empty_polls > self.max_empty_polls else 1),
                         5  # Cap at 5 seconds
                     )
                     time.sleep(sleep_time)
@@ -323,6 +338,13 @@ class WebhookConsumer:
                         f"circuit breaks {self.stats['circuit_breaks']}"
                     )
                     last_stats_time = time.time()
+                    
+                    # Also check sentinel status periodically
+                    sentinel_status = check_sentinel_health(self.config)
+                    if sentinel_status["status"] == "ok":
+                        logger.debug(f"Redis Sentinel active: {sentinel_status.get('slave_count')} slaves")
+                    else:
+                        logger.warning(f"Redis Sentinel issue detected: {sentinel_status.get('error')}")
                     
             except KeyboardInterrupt:
                 logger.info("Consumer stopped by user")
