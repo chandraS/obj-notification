@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-consumer
+  namespace: object-monitor
+  labels:
+    app: webhook-consumer
+spec:
+  replicas: 2  # Start with 2 replicas
+  selector:
+    matchLabels:
+      app: webhook-consumer
+  template:
+    metadata:
+      labels:
+        app: webhook-consumer
+    spec:
+      containers:
+      - name: webhook-consumer
+        image: ${YOUR_REGISTRY}/bucket-consumer:latest  # Replace with your image
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        env:
+        - name: REDIS_HOST
+          value: "redis"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: bucket-secrets
+              key: webhook-url
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config-volume
+        configMap:
+          name: monitor-config
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webhook-consumer-hpa
+  namespace: object-monitor
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webhook-consumer
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
