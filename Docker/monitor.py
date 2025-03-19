@@ -5,6 +5,8 @@ Linode Object Storage Monitor
 This script monitors Linode Object Storage buckets across multiple regions,
 detects new or updated objects, and sends notifications via a Redis queue.
 It uses optimized thread pools and staggered scanning for efficiency.
+
+Supports Redis Sentinel for high availability.
 """
 
 import boto3
@@ -31,7 +33,8 @@ from utils import (
     save_object_state,
     publish_notification,
     check_redis_health,
-    check_queue_stats
+    check_queue_stats,
+    check_sentinel_health
 )
 
 # Set up logging
@@ -236,7 +239,9 @@ class BucketScanner(threading.Thread):
                             stats["detected_objects"] += 1
             
             # Update last scan time
-            self.redis_client.set(f"linode:objstore:last_scan:{bucket_name}", scan_time)
+            # Use redis master explicitly for this write operation
+            master_client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+            master_client.set(f"linode:objstore:last_scan:{bucket_name}", scan_time)
             
             # Calculate scan duration
             stats["scan_duration"] = time.time() - start_time
@@ -311,9 +316,12 @@ class MultiRegionMonitor:
     def load_last_scan_times(self):
         """Load last scan times for all buckets from Redis."""
         try:
+            # Use slave client for reads when available
+            client = self.redis_client.get("slave", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+            
             for bucket_config in self.config.get("buckets", []):
                 bucket_name = bucket_config["name"]
-                last_scan = self.redis_client.get(f"linode:objstore:last_scan:{bucket_name}")
+                last_scan = client.get(f"linode:objstore:last_scan:{bucket_name}")
                 if last_scan:
                     self.last_scan_times[bucket_name] = float(last_scan)
         except Exception as e:
@@ -559,12 +567,15 @@ class MultiRegionMonitor:
                     self2.wfile.write(json.dumps(health_status).encode())
                     
                 elif self2.path == '/ready':
-                    # Check if Redis is available
+                    # Check if Redis is available with Sentinel status
                     redis_ok = check_redis_health(self.redis_client)
-                    status_code = 200 if redis_ok else 503
+                    sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
+                    
+                    status_code = 200 if (redis_ok and sentinel_ok) else 503
                     ready_status = {
-                        "status": "ready" if redis_ok else "not_ready",
-                        "redis": "ok" if redis_ok else "error"
+                        "status": "ready" if (redis_ok and sentinel_ok) else "not_ready",
+                        "redis": "ok" if redis_ok else "error",
+                        "sentinel": "ok" if sentinel_ok else "error"
                     }
                     self2.send_response(status_code)
                     self2.send_header('Content-Type', 'application/json')
@@ -572,14 +583,16 @@ class MultiRegionMonitor:
                     self2.wfile.write(json.dumps(ready_status).encode())
                     
                 elif self2.path == '/metrics':
-                    # Return current metrics
+                    # Return current metrics with Sentinel status
                     redis_stats = check_queue_stats(self.redis_client, self.config)
+                    sentinel_stats = check_sentinel_health(self.config)
                     client_stats = self.client_cache.get_stats()
                     
                     metrics = {
                         "scan_stats": self.scan_stats,
                         "client_cache": client_stats,
                         "redis": redis_stats,
+                        "sentinel": sentinel_stats,
                         "buckets": {
                             "total": len(self.config.get("buckets", [])),
                             "scanned": len(self.last_scan_times)
@@ -610,9 +623,16 @@ class MultiRegionMonitor:
     
     def run(self):
         """Run the monitor in a continuous loop."""
-        logger.info("Starting Multi-Region Object Storage Monitor")
+        logger.info("Starting Multi-Region Object Storage Monitor with Redis Sentinel Support")
         logger.info(f"Monitoring {len(self.config.get('buckets', []))} buckets across {len(self.get_all_regions())} regions")
         logger.info(f"Polling interval: {self.config.get('defaults', {}).get('polling_interval', 60)}s")
+        
+        # Check Redis Sentinel status
+        sentinel_status = check_sentinel_health(self.config)
+        if sentinel_status["status"] == "ok":
+            logger.info(f"Redis Sentinel active: Master at {sentinel_status.get('master')}, {sentinel_status.get('slave_count')} slaves")
+        else:
+            logger.warning(f"Redis Sentinel not available: {sentinel_status.get('error')}")
         
         while self.running:
             try:
