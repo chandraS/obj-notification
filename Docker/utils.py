@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Utility functions for the Linode Object Storage Monitoring System.
+With Redis Sentinel support for high availability.
 """
 
 import json
@@ -9,6 +10,7 @@ import os
 import time
 import yaml
 import redis
+from redis.sentinel import Sentinel
 from datetime import datetime
 
 # Configure logging
@@ -81,22 +83,83 @@ def load_config():
 
 # Redis client creation
 def create_redis_client(config):
-    """Create a Redis client with connection pooling."""
+    """Create Redis clients with Sentinel support for HA."""
     redis_config = config.get("redis", {})
     
-    # Connection pool settings
-    pool = redis.ConnectionPool(
-        host=redis_config.get("host", "localhost"),
-        port=redis_config.get("port", 6379),
-        db=redis_config.get("db", 0),
-        password=redis_config.get("password"),
-        decode_responses=True,
-        max_connections=20,
-        socket_timeout=5.0,
-        socket_connect_timeout=5.0
-    )
+    # Get Sentinel configuration
+    sentinel_host = redis_config.get("sentinel_host", "redis-sentinel")
+    sentinel_port = redis_config.get("sentinel_port", 26379)
+    master_name = redis_config.get("master_name", "mymaster")
+    password = redis_config.get("password", None)
+    db = redis_config.get("db", 0)
     
-    return redis.Redis(connection_pool=pool)
+    # Set up connection pools for better performance
+    socket_timeout = 5.0
+    socket_connect_timeout = 5.0
+    
+    try:
+        # Create Sentinel manager
+        sentinel = Sentinel(
+            [(sentinel_host, sentinel_port)],
+            socket_timeout=socket_timeout,
+            password=password
+        )
+        
+        # Create Redis clients - one for master (writes), one for slave (reads)
+        master = sentinel.master_for(
+            master_name,
+            socket_timeout=socket_timeout,
+            db=db,
+            password=password,
+            decode_responses=True
+        )
+        
+        slave = sentinel.slave_for(
+            master_name,
+            socket_timeout=socket_timeout,
+            db=db,
+            password=password,
+            decode_responses=True
+        )
+        
+        logger.info("Successfully connected to Redis via Sentinel")
+        
+        # Return both clients
+        return {
+            "master": master,  # Use for writes
+            "slave": slave     # Use for reads
+        }
+    except Exception as e:
+        logger.error(f"Error connecting to Redis via Sentinel: {e}")
+        
+        # Fallback to direct connection if Sentinel fails
+        logger.warning("Falling back to direct Redis connection")
+        try:
+            # Try to connect directly to Redis master as fallback
+            fallback_host = redis_config.get("host", "redis-0.redis")
+            fallback_port = redis_config.get("port", 6379)
+            
+            redis_client = redis.Redis(
+                host=fallback_host,
+                port=fallback_port,
+                db=db,
+                password=password,
+                decode_responses=True,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout
+            )
+            
+            # Simple connection test
+            redis_client.ping()
+            
+            # Return the same client for both reads and writes in fallback mode
+            return {
+                "master": redis_client,
+                "slave": redis_client
+            }
+        except Exception as fallback_error:
+            logger.error(f"Fallback Redis connection also failed: {fallback_error}")
+            raise
 
 # State management functions
 def get_object_state(redis_client, config, bucket, key):
@@ -104,13 +167,19 @@ def get_object_state(redis_client, config, bucket, key):
     state_prefix = config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
     redis_key = f"{state_prefix}{bucket}:{key}"
     
-    state_json = redis_client.get(redis_key)
-    if state_json:
-        try:
-            return json.loads(state_json)
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON in Redis for {redis_key}")
+    # Use slave for reads if available, otherwise use what we have
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
     
+    try:
+        state_json = client.get(redis_key)
+        if state_json:
+            try:
+                return json.loads(state_json)
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in Redis for {redis_key}")
+    except redis.RedisError as e:
+        logger.error(f"Redis error getting state for {redis_key}: {e}")
+        
     return None
 
 def save_object_state(redis_client, config, bucket, key, state):
@@ -121,9 +190,12 @@ def save_object_state(redis_client, config, bucket, key, state):
     # Get TTL from config or use default (30 days)
     ttl = config.get("redis", {}).get("ttl", 2592000)
     
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
     try:
         # Set with expiration to prevent unlimited growth
-        redis_client.setex(redis_key, ttl, json.dumps(state))
+        client.setex(redis_key, ttl, json.dumps(state))
         return True
     except Exception as e:
         logger.error(f"Error saving state to Redis for {redis_key}: {e}")
@@ -134,15 +206,18 @@ def publish_notification(redis_client, config, message):
     """Publish a notification to the Redis queue."""
     queue_name = config.get("redis", {}).get("queue_name", "linode:notifications:queue")
     
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
     try:
         # Convert message to JSON string
         message_json = json.dumps(message)
         
         # Push to Redis list used as queue
-        redis_client.rpush(queue_name, message_json)
+        client.rpush(queue_name, message_json)
         
         # Optional: Set TTL on queue to prevent unbounded growth
-        redis_client.expire(queue_name, 604800)  # 7 days
+        client.expire(queue_name, 604800)  # 7 days
         
         return True
     except Exception as e:
@@ -153,8 +228,11 @@ def get_notifications(redis_client, config, batch_size=10):
     """Get a batch of notifications from the Redis queue with atomic operations."""
     queue_name = config.get("redis", {}).get("queue_name", "linode:notifications:queue")
     
+    # Use master for queue operations (atomic LRANGE+LTRIM)
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
     # Create a pipeline to execute commands atomically
-    pipe = redis_client.pipeline()
+    pipe = client.pipeline()
     pipe.lrange(queue_name, 0, batch_size - 1)
     pipe.ltrim(queue_name, batch_size, -1)
     
@@ -184,17 +262,56 @@ def get_notifications(redis_client, config, batch_size=10):
 def check_redis_health(redis_client):
     """Check if Redis is healthy."""
     try:
-        return redis_client.ping()
+        # Check both master and slave if available
+        if isinstance(redis_client, dict):
+            master_ok = redis_client["master"].ping()
+            slave_ok = redis_client["slave"].ping()
+            return master_ok and slave_ok
+        else:
+            return redis_client.ping()
     except Exception as e:
         logger.error(f"Redis health check failed: {e}")
         return False
+
+def check_sentinel_health(config):
+    """Check Sentinel status."""
+    redis_config = config.get("redis", {})
+    sentinel_host = redis_config.get("sentinel_host", "redis-sentinel")
+    sentinel_port = redis_config.get("sentinel_port", 26379)
+    master_name = redis_config.get("master_name", "mymaster")
+    
+    try:
+        # Connect to Sentinel
+        sentinel = Sentinel(
+            [(sentinel_host, sentinel_port)],
+            socket_timeout=1.0
+        )
+        
+        # Get master address
+        master = sentinel.discover_master(master_name)
+        
+        # Get slave addresses
+        slaves = sentinel.discover_slaves(master_name)
+        
+        return {
+            "status": "ok",
+            "master": f"{master[0]}:{master[1]}",
+            "slaves": [f"{slave[0]}:{slave[1]}" for slave in slaves],
+            "slave_count": len(slaves)
+        }
+    except Exception as e:
+        logger.error(f"Sentinel health check failed: {e}")
+        return {"status": "error", "error": str(e)}
 
 def check_queue_stats(redis_client, config):
     """Get statistics about the notification queue."""
     queue_name = config.get("redis", {}).get("queue_name", "linode:notifications:queue")
     
+    # Use slave for reads when possible
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
     try:
-        queue_length = redis_client.llen(queue_name)
+        queue_length = client.llen(queue_name)
         return {
             "queue_length": queue_length,
             "queue_name": queue_name
