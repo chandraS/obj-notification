@@ -58,7 +58,7 @@ metadata:
   namespace: object-monitor
 spec:
   serviceName: "redis"
-  replicas: 3  # 3 Redis nodes, each with a Sentinel sidecar
+  replicas: 3
   selector:
     matchLabels:
       app: redis
@@ -68,32 +68,77 @@ spec:
         app: redis
     spec:
       initContainers:
+      - name: wait-for-dns
+        image: busybox:1.36
+        command: ['/bin/sh', '-c']
+        args:
+          - |
+            set -x
+            if [ "$(hostname)" = "redis-0" ]; then
+              echo "This is redis-0, no need to wait"
+              exit 0
+            fi
+
+            FQDN="redis-0.redis.object-monitor.svc.cluster.local"
+            echo "Waiting for $FQDN to be reachable..."
+            until nc -z $FQDN 6379; do
+              echo "Cannot connect to $FQDN:6379, retrying in 5s..."
+              sleep 5
+            done
+            echo "$FQDN is reachable, continuing"
+
       - name: init-redis
         image: redis:7.0-alpine
         command: ['/bin/sh', '-c']
         args:
           - |
             set -ex
-            # Generate the proper redis.conf for this instance
             cp /mnt/config/redis.conf /etc/redis/redis.conf
-            
-            # Configure replication for non-master instances
+
             if [ "$(hostname)" != "redis-0" ]; then
-              echo "replicaof redis-0.redis 6379" >> /etc/redis/redis.conf
+              # For replicas, use the FQDN in redis.conf
+              echo "replicaof redis-0.redis.object-monitor.svc.cluster.local 6379" >> /etc/redis/redis.conf
             fi
-            
-            # Copy sentinel config
+
             cp /mnt/config/sentinel.conf /etc/redis/sentinel.conf
+
+            # Get our own IP (this works for all pods)
+            MY_IP=$(hostname -i)
             
-            # Update sentinel configuration with pod-specific info
-            echo "sentinel announce-ip $(hostname).redis" >> /etc/redis/sentinel.conf
+            if [ "$(hostname)" = "redis-0" ]; then
+              # For redis-0, monitor itself by IP
+              echo "sentinel monitor mymaster $MY_IP 6379 1" >> /etc/redis/sentinel.conf
+              echo "Master IP is $MY_IP (self)"
+            else
+              # For other pods, get the IP of redis-0
+              # First try connecting to get the IP
+              MASTER_IP=$(getent hosts redis-0.redis.object-monitor.svc.cluster.local | awk '{print $1}')
+              if [ -z "$MASTER_IP" ]; then
+                # If we can't get the IP, read it from a ping command
+                echo "Trying alternate method to get master IP..."
+                MASTER_IP=$(ping -c 1 redis-0.redis.object-monitor.svc.cluster.local | grep PING | awk -F'[()]' '{print $2}')
+              fi
+              
+              if [ -z "$MASTER_IP" ]; then
+                # If all else fails, use a default cluster IP range guess
+                echo "Warning: Could not determine master IP, using fixed IP"
+                MASTER_IP=$(dig +short redis-0.redis.object-monitor.svc.cluster.local)
+              fi
+              
+              echo "Using master IP: $MASTER_IP"
+              echo "sentinel monitor mymaster $MASTER_IP 6379 1" >> /etc/redis/sentinel.conf
+            fi
+
+            # Always use IP-based announcement
+            echo "sentinel announce-ip $MY_IP" >> /etc/redis/sentinel.conf
             echo "sentinel announce-port 26379" >> /etc/redis/sentinel.conf
-            
+
         volumeMounts:
         - name: redis-config
           mountPath: /mnt/config
         - name: config
           mountPath: /etc/redis
+
       containers:
       - name: redis
         image: redis:7.0-alpine
@@ -120,6 +165,7 @@ spec:
             - ping
           initialDelaySeconds: 30
           timeoutSeconds: 5
+          periodSeconds: 10
         readinessProbe:
           exec:
             command:
@@ -127,15 +173,17 @@ spec:
             - ping
           initialDelaySeconds: 5
           timeoutSeconds: 1
+          periodSeconds: 5
+
       - name: sentinel
         image: redis:7.0-alpine
         command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
         resources:
           requests:
-            cpu: "0.1"
+            cpu: "100m"
             memory: "256Mi"
           limits:
-            cpu: "0.2"
+            cpu: "200m"
             memory: "512Mi"
         ports:
         - containerPort: 26379
@@ -150,25 +198,36 @@ spec:
             - -p
             - "26379"
             - ping
-          initialDelaySeconds: 30
+          initialDelaySeconds: 60
           timeoutSeconds: 5
+          periodSeconds: 10
         readinessProbe:
           exec:
             command:
             - redis-cli
             - -p
             - "26379"
-            - sentinel
-            - master
-            - mymaster
-          initialDelaySeconds: 30
+            - ping
+          initialDelaySeconds: 60
           timeoutSeconds: 5
+          periodSeconds: 10
+        startupProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          failureThreshold: 30
+          periodSeconds: 10
+
       volumes:
       - name: redis-config
         configMap:
           name: redis-config
       - name: config
         emptyDir: {}
+
   volumeClaimTemplates:
   - metadata:
       name: redis-data
