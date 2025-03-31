@@ -4,7 +4,6 @@ Linode Object Storage Monitor
 
 This script monitors Linode Object Storage buckets across multiple regions,
 detects new or updated objects, and sends notifications via a Redis queue.
-It uses optimized thread pools and staggered scanning for efficiency.
 
 Supports Redis Sentinel for high availability.
 """
@@ -180,11 +179,11 @@ class BucketScanner(threading.Thread):
                     recent_threshold = 86400  # 24 hours in seconds
                     is_truly_new = is_missing_state and (current_time - object_modified <= recent_threshold)
                     
-                    # Determine appropriate event type
+                    # Determine event type
                     if is_truly_new:
                         event_type = "created"
                     elif is_missing_state:
-                        # Object is not recent but missing state - likely state expired
+                        # Object is not recent but missing state, may be state is expired
                         event_type = "detected"
                     elif is_updated:
                         event_type = "updated"
@@ -267,7 +266,7 @@ class BucketScanner(threading.Thread):
             })
 
 class MultiRegionMonitor:
-    """Monitor for hundreds of buckets across multiple regions with optimized resource usage."""
+    """Monitor for buckets across multiple regions"""
     
     def __init__(self):
         """Initialize the monitor with configuration."""
