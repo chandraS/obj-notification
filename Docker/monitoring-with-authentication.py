@@ -561,259 +561,259 @@ class MultiRegionMonitor:
             self.scan_stats["total_detected_objects"] += result.get("detected_objects", 0)
     
     def start_health_server(self):
-    """Start a simple HTTP server for health checks and API."""
-    class APIHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self2, *args, **kwargs):
-            self2.monitor = self
-            super().__init__(*args, **kwargs)
-        
-        def authenticate_request(self2):
-            """Authenticate a request using JWT."""
-            auth_header = self2.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                self2.send_response(401)
-                self2.send_header('Content-Type', 'application/json')
-                self2.end_headers()
-                self2.wfile.write(json.dumps({"error": "Authentication required", "message": "Use Bearer token authentication"}).encode())
-                return None
+        """Start a simple HTTP server for health checks and API."""
+        class APIHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self2, *args, **kwargs):
+                self2.monitor = self
+                super().__init__(*args, **kwargs)
             
-            token = auth_header[7:]  # Remove 'Bearer ' prefix
-            payload = validate_jwt_token(token)
-            
-            if not payload:
-                self2.send_response(401)
-                self2.send_header('Content-Type', 'application/json')
-                self2.end_headers()
-                self2.wfile.write(json.dumps({"error": "Invalid or expired token"}).encode())
-                return None
-            
-            return payload
-            
-        def do_GET(self2):
-            if self2.path == '/health':
-                # Basic health check
-                health_status = {"status": "ok"}
-                self2.send_response(200)
-                self2.send_header('Content-Type', 'application/json')
-                self2.end_headers()
-                self2.wfile.write(json.dumps(health_status).encode())
-                
-            elif self2.path == '/ready':
-                # Check if Redis is available with Sentinel status
-                redis_ok = check_redis_health(self.redis_client)
-                sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
-                
-                status_code = 200 if (redis_ok and sentinel_ok) else 503
-                ready_status = {
-                    "status": "ready" if (redis_ok and sentinel_ok) else "not_ready",
-                    "redis": "ok" if redis_ok else "error",
-                    "sentinel": "ok" if sentinel_ok else "error"
-                }
-                self2.send_response(status_code)
-                self2.send_header('Content-Type', 'application/json')
-                self2.end_headers()
-                self2.wfile.write(json.dumps(ready_status).encode())
-                
-            elif self2.path == '/metrics':
-                # Return current metrics with Sentinel status
-                redis_stats = check_queue_stats(self.redis_client, self.config)
-                sentinel_stats = check_sentinel_health(self.config)
-                client_stats = self.client_cache.get_stats()
-                
-                metrics = {
-                    "scan_stats": self.scan_stats,
-                    "client_cache": client_stats,
-                    "redis": redis_stats,
-                    "sentinel": sentinel_stats,
-                    "buckets": {
-                        "total": len(self.config.get("buckets", [])),
-                        "scanned": len(self.last_scan_times)
-                    }
-                }
-                
-                self2.send_response(200)
-                self2.send_header('Content-Type', 'application/json')
-                self2.end_headers()
-                self2.wfile.write(json.dumps(metrics).encode())
-            
-            elif self2.path == '/api/bucket-notifications/status':
-                # Authenticate request
-                payload = self2.authenticate_request()
-                if not payload:
-                    return
-                
-                # Get notification status for all buckets
-                statuses = {}
-                for bucket_config in self.config.get("buckets", []):
-                    bucket_name = bucket_config["name"]
-                    enabled = is_bucket_notifications_enabled(self.redis_client, bucket_name)
-                    statuses[bucket_name] = {
-                        "name": bucket_name,
-                        "notifications_enabled": enabled
-                    }
-                
-                self2.send_response(200)
-                self2.send_header('Content-Type', 'application/json')
-                self2.send_header('Access-Control-Allow-Origin', '*')
-                self2.end_headers()
-                self2.wfile.write(json.dumps({"buckets": list(statuses.values())}).encode())
-                
-            else:
-                self2.send_response(404)
-                self2.end_headers()
-        
-        def do_POST(self2):
-            import urllib.parse
-            
-            parsed_url = urllib.parse.urlparse(self2.path)
-            query_params = urllib.parse.parse_qs(parsed_url.query)
-            
-            if parsed_url.path == '/api/auth/token':
-                # Handle token generation without authentication
-                content_length = int(self2.headers['Content-Length'])
-                post_data = self2.rfile.read(content_length)
-                try:
-                    data = json.loads(post_data.decode('utf-8'))
-                except json.JSONDecodeError:
-                    self2.send_response(400)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Invalid JSON in request"}).encode())
-                    return
-                
-                client_id = data.get('client_id')
-                client_secret = data.get('client_secret')
-                
-                if not client_id or not client_secret:
-                    self2.send_response(400)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Missing credentials", "message": "client_id and client_secret are required"}).encode())
-                    return
-                
-                # Validate credentials
-                if not validate_client_credentials(client_id, client_secret):
+            def authenticate_request(self2):
+                """Authenticate a request using JWT."""
+                auth_header = self2.headers.get('Authorization')
+                if not auth_header or not auth_header.startswith('Bearer '):
                     self2.send_response(401)
                     self2.send_header('Content-Type', 'application/json')
                     self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Invalid credentials"}).encode())
-                    return
+                    self2.wfile.write(json.dumps({"error": "Authentication required", "message": "Use Bearer token authentication"}).encode())
+                    return None
                 
-                # Generate JWT token
-                token = generate_jwt_token(client_id)
+                token = auth_header[7:]  # Remove 'Bearer ' prefix
+                payload = validate_jwt_token(token)
                 
-                self2.send_response(200)
-                self2.send_header('Content-Type', 'application/json')
-                self2.end_headers()
-                self2.wfile.write(json.dumps({
-                    "access_token": token,
-                    "token_type": "Bearer",
-                    "expires_in": 86400  # 24 hours
-                }).encode())
-                
-            elif parsed_url.path == '/api/bucket-notifications/disable':
-                # Authenticate request
-                payload = self2.authenticate_request()
                 if not payload:
-                    return
-                
-                # Get bucket parameter
-                bucket_name = query_params.get('bucket', [None])[0]
-                
-                if not bucket_name:
-                    self2.send_response(400)
+                    self2.send_response(401)
                     self2.send_header('Content-Type', 'application/json')
                     self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Missing bucket parameter"}).encode())
-                    return
+                    self2.wfile.write(json.dumps({"error": "Invalid or expired token"}).encode())
+                    return None
                 
-                # Check if bucket exists
-                bucket_exists = any(b["name"] == bucket_name for b in self.config.get("buckets", []))
-                if not bucket_exists:
+                return payload
+                
+            def do_GET(self2):
+                if self2.path == '/health':
+                    # Basic health check
+                    health_status = {"status": "ok"}
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps(health_status).encode())
+                    
+                elif self2.path == '/ready':
+                    # Check if Redis is available with Sentinel status
+                    redis_ok = check_redis_health(self.redis_client)
+                    sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
+                    
+                    status_code = 200 if (redis_ok and sentinel_ok) else 503
+                    ready_status = {
+                        "status": "ready" if (redis_ok and sentinel_ok) else "not_ready",
+                        "redis": "ok" if redis_ok else "error",
+                        "sentinel": "ok" if sentinel_ok else "error"
+                    }
+                    self2.send_response(status_code)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps(ready_status).encode())
+                    
+                elif self2.path == '/metrics':
+                    # Return current metrics with Sentinel status
+                    redis_stats = check_queue_stats(self.redis_client, self.config)
+                    sentinel_stats = check_sentinel_health(self.config)
+                    client_stats = self.client_cache.get_stats()
+                    
+                    metrics = {
+                        "scan_stats": self.scan_stats,
+                        "client_cache": client_stats,
+                        "redis": redis_stats,
+                        "sentinel": sentinel_stats,
+                        "buckets": {
+                            "total": len(self.config.get("buckets", [])),
+                            "scanned": len(self.last_scan_times)
+                        }
+                    }
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps(metrics).encode())
+                
+                elif self2.path == '/api/bucket-notifications/status':
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
+                    
+                    # Get notification status for all buckets
+                    statuses = {}
+                    for bucket_config in self.config.get("buckets", []):
+                        bucket_name = bucket_config["name"]
+                        enabled = is_bucket_notifications_enabled(self.redis_client, bucket_name)
+                        statuses[bucket_name] = {
+                            "name": bucket_name,
+                            "notifications_enabled": enabled
+                        }
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.send_header('Access-Control-Allow-Origin', '*')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps({"buckets": list(statuses.values())}).encode())
+                    
+                else:
                     self2.send_response(404)
-                    self2.send_header('Content-Type', 'application/json')
                     self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Bucket not found"}).encode())
-                    return
-                
-                # Disable notifications
-                disable_bucket_notifications(self.redis_client, bucket_name)
-                logger.info(f"Notifications disabled for bucket {bucket_name} via API")
-                
-                self2.send_response(200)
-                self2.send_header('Content-Type', 'application/json')
-                self2.send_header('Access-Control-Allow-Origin', '*')
-                self2.end_headers()
-                self2.wfile.write(json.dumps({
-                    "status": "success",
-                    "bucket": bucket_name,
-                    "notifications": "disabled"
-                }).encode())
-                
-            elif parsed_url.path == '/api/bucket-notifications/enable':
-                # Authenticate request
-                payload = self2.authenticate_request()
-                if not payload:
-                    return
-                
-                # Get bucket parameter
-                bucket_name = query_params.get('bucket', [None])[0]
-                
-                if not bucket_name:
-                    self2.send_response(400)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Missing bucket parameter"}).encode())
-                    return
-                
-                # Check if bucket exists
-                bucket_exists = any(b["name"] == bucket_name for b in self.config.get("buckets", []))
-                if not bucket_exists:
-                    self2.send_response(404)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps({"error": "Bucket not found"}).encode())
-                    return
-                
-                # Enable notifications
-                enable_bucket_notifications(self.redis_client, bucket_name)
-                logger.info(f"Notifications enabled for bucket {bucket_name} via API")
-                
-                self2.send_response(200)
-                self2.send_header('Content-Type', 'application/json')
-                self2.send_header('Access-Control-Allow-Origin', '*')
-                self2.end_headers()
-                self2.wfile.write(json.dumps({
-                    "status": "success",
-                    "bucket": bucket_name,
-                    "notifications": "enabled"
-                }).encode())
-                
-            else:
-                self2.send_response(404)
-                self2.end_headers()
-        
-        def do_OPTIONS(self2):
-            # Handle CORS preflight requests
-            self2.send_response(200)
-            self2.send_header('Access-Control-Allow-Origin', '*')
-            self2.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self2.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-            self2.end_headers()
             
-        def log_message(self2, format, *args):
-            # Suppress logs from the HTTP server
-            logger.debug(f"API request: {format % args}")
-    
-    def start_server():
-        httpd = socketserver.ThreadingTCPServer(('', 8080), APIHandler)
-        httpd.serve_forever()
+            def do_POST(self2):
+                import urllib.parse
+                
+                parsed_url = urllib.parse.urlparse(self2.path)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                
+                if parsed_url.path == '/api/auth/token':
+                    # Handle token generation without authentication
+                    content_length = int(self2.headers['Content-Length'])
+                    post_data = self2.rfile.read(content_length)
+                    try:
+                        data = json.loads(post_data.decode('utf-8'))
+                    except json.JSONDecodeError:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Invalid JSON in request"}).encode())
+                        return
+                    
+                    client_id = data.get('client_id')
+                    client_secret = data.get('client_secret')
+                    
+                    if not client_id or not client_secret:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Missing credentials", "message": "client_id and client_secret are required"}).encode())
+                        return
+                    
+                    # Validate credentials
+                    if not validate_client_credentials(client_id, client_secret):
+                        self2.send_response(401)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Invalid credentials"}).encode())
+                        return
+                    
+                    # Generate JWT token
+                    token = generate_jwt_token(client_id)
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps({
+                        "access_token": token,
+                        "token_type": "Bearer",
+                        "expires_in": 86400  # 24 hours
+                    }).encode())
+                    
+                elif parsed_url.path == '/api/bucket-notifications/disable':
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
+                    
+                    # Get bucket parameter
+                    bucket_name = query_params.get('bucket', [None])[0]
+                    
+                    if not bucket_name:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Missing bucket parameter"}).encode())
+                        return
+                    
+                    # Check if bucket exists
+                    bucket_exists = any(b["name"] == bucket_name for b in self.config.get("buckets", []))
+                    if not bucket_exists:
+                        self2.send_response(404)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Bucket not found"}).encode())
+                        return
+                    
+                    # Disable notifications
+                    disable_bucket_notifications(self.redis_client, bucket_name)
+                    logger.info(f"Notifications disabled for bucket {bucket_name} via API")
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.send_header('Access-Control-Allow-Origin', '*')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps({
+                        "status": "success",
+                        "bucket": bucket_name,
+                        "notifications": "disabled"
+                    }).encode())
+                    
+                elif parsed_url.path == '/api/bucket-notifications/enable':
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
+                    
+                    # Get bucket parameter
+                    bucket_name = query_params.get('bucket', [None])[0]
+                    
+                    if not bucket_name:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Missing bucket parameter"}).encode())
+                        return
+                    
+                    # Check if bucket exists
+                    bucket_exists = any(b["name"] == bucket_name for b in self.config.get("buckets", []))
+                    if not bucket_exists:
+                        self2.send_response(404)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Bucket not found"}).encode())
+                        return
+                    
+                    # Enable notifications
+                    enable_bucket_notifications(self.redis_client, bucket_name)
+                    logger.info(f"Notifications enabled for bucket {bucket_name} via API")
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.send_header('Access-Control-Allow-Origin', '*')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps({
+                        "status": "success",
+                        "bucket": bucket_name,
+                        "notifications": "enabled"
+                    }).encode())
+                    
+                else:
+                    self2.send_response(404)
+                    self2.end_headers()
+            
+            def do_OPTIONS(self2):
+                # Handle CORS preflight requests
+                self2.send_response(200)
+                self2.send_header('Access-Control-Allow-Origin', '*')
+                self2.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self2.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                self2.end_headers()
+                
+            def log_message(self2, format, *args):
+                # Suppress logs from the HTTP server
+                logger.debug(f"API request: {format % args}")
         
-    # Start in a separate thread
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    server_thread.start()
-    logger.info("Health check and API server started on port 8080")
-    
+        def start_server():
+            httpd = socketserver.ThreadingTCPServer(('', 8080), APIHandler)
+            httpd.serve_forever()
+            
+        # Start in a separate thread
+        server_thread = threading.Thread(target=start_server, daemon=True)
+        server_thread.start()
+        logger.info("Health check and API server started on port 8080")
+        
     def run(self):
         """Run the monitor in a continuous loop."""
         logger.info("Starting Multi-Region Object Storage Monitor with Redis Sentinel Support")
