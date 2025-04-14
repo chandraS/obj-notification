@@ -94,42 +94,48 @@ spec:
           - |
             set -ex
             cp /mnt/config/redis.conf /etc/redis/redis.conf
-
+            
+            # Configure Redis replication (replicas only)
             if [ "$(hostname)" != "redis-0" ]; then
-              # For replicas, use the FQDN in redis.conf
               echo "replicaof redis-0.redis.object-monitor.svc.cluster.local 6379" >> /etc/redis/redis.conf
             fi
-
+            
+            # Copy base sentinel config
             cp /mnt/config/sentinel.conf /etc/redis/sentinel.conf
-
-            # Get our own IP (this works for all pods)
+            
+            # Get our own IP
             MY_IP=$(hostname -i)
             
+            # For redis-0, monitor itself by IP
             if [ "$(hostname)" = "redis-0" ]; then
-              # For redis-0, monitor itself by IP
-              echo "sentinel monitor mymaster $MY_IP 6379 1" >> /etc/redis/sentinel.conf
+              echo "sentinel monitor mymaster $MY_IP 6379 2" >> /etc/redis/sentinel.conf
               echo "Master IP is $MY_IP (self)"
             else
-              # For other pods, get the IP of redis-0
-              # First try connecting to get the IP
-              MASTER_IP=$(getent hosts redis-0.redis.object-monitor.svc.cluster.local | awk '{print $1}')
-              if [ -z "$MASTER_IP" ]; then
-                # If we can't get the IP, read it from a ping command
-                echo "Trying alternate method to get master IP..."
-                MASTER_IP=$(ping -c 1 redis-0.redis.object-monitor.svc.cluster.local | grep PING | awk -F'[()]' '{print $2}')
-              fi
+              # For other pods, try to resolve redis-0's IP using FQDN
+              COUNTER=0
+              MASTER_IP=""
+              
+              while [ -z "$MASTER_IP" ] && [ $COUNTER -lt 10 ]; do
+                # Try getent with FQDN
+                MASTER_IP=$(getent hosts redis-0.redis.object-monitor.svc.cluster.local | awk '{print $1}')
+                
+                if [ -z "$MASTER_IP" ]; then
+                  echo "Waiting for DNS resolution, attempt $COUNTER..."
+                  sleep 3
+                  COUNTER=$((COUNTER+1))
+                fi
+              done
               
               if [ -z "$MASTER_IP" ]; then
-                # If all else fails, use a default cluster IP range guess
-                echo "Warning: Could not determine master IP, using fixed IP"
-                MASTER_IP=$(dig +short redis-0.redis.object-monitor.svc.cluster.local)
+                echo "WARNING: Could not resolve master IP, using FQDN directly"
+                echo "sentinel monitor mymaster redis-0.redis.object-monitor.svc.cluster.local 6379 2" >> /etc/redis/sentinel.conf
+              else
+                echo "Using master IP: $MASTER_IP"
+                echo "sentinel monitor mymaster $MASTER_IP 6379 2" >> /etc/redis/sentinel.conf
               fi
-              
-              echo "Using master IP: $MASTER_IP"
-              echo "sentinel monitor mymaster $MASTER_IP 6379 1" >> /etc/redis/sentinel.conf
             fi
-
-            # Always use IP-based announcement
+            
+            # Always add announce config
             echo "sentinel announce-ip $MY_IP" >> /etc/redis/sentinel.conf
             echo "sentinel announce-port 26379" >> /etc/redis/sentinel.conf
 
@@ -177,7 +183,7 @@ spec:
 
       - name: sentinel
         image: redis:7.0-alpine
-        command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
+        command: ["redis-server", "/etc/redis/sentinel.conf", "--sentinel"]
         resources:
           requests:
             cpu: "100m"
@@ -233,6 +239,9 @@ spec:
       name: redis-data
     spec:
       accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
       resources:
         requests:
           storage: 10Gi
