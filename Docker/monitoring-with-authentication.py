@@ -41,7 +41,9 @@ from utils import (
     disable_bucket_notifications,
     generate_jwt_token,
     validate_jwt_token,
-    validate_client_credentials
+    validate_client_credentials,
+    get_pending_bucket_configs,
+    add_bucket_info_to_redis
 )
 
 # Set up logging
@@ -660,6 +662,23 @@ class MultiRegionMonitor:
                     self2.send_header('Access-Control-Allow-Origin', '*')
                     self2.end_headers()
                     self2.wfile.write(json.dumps({"buckets": list(statuses.values())}).encode())
+
+                elif self2.path == '/api/buckets/pending':
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
+                    
+                    # Get pending bucket configurations
+                    pending_buckets = get_pending_bucket_configs(self.redis_client)
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps({
+                        "pending_buckets": pending_buckets,
+                        "count": len(pending_buckets)
+                    }).encode())
                     
                 else:
                     self2.send_response(404)
@@ -843,7 +862,55 @@ class MultiRegionMonitor:
                         "bucket": bucket_name,
                         "notifications": "enabled"
                     }).encode())
+
+                elif parsed_url.path == '/api/buckets/add-pending':
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
                     
+                    # Parse request body
+                    content_length = int(self2.headers['Content-Length'])
+                    post_data = self2.rfile.read(content_length)
+                    
+                    try:
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        # Validate required fields
+                        required_fields = ['name', 'access_key', 'secret_key', 'region', 'webhook_url']
+                        for field in required_fields:
+                            if field not in data:
+                                self2.send_response(400)
+                                self2.send_header('Content-Type', 'application/json')
+                                self2.end_headers()
+                                self2.wfile.write(json.dumps({
+                                    "error": f"Missing required field: {field}"
+                                }).encode())
+                                return
+                        
+                        # Add submission timestamp
+                        data['submitted_at'] = datetime.now().isoformat()
+                        
+                        # Store in Redis for admin review
+                        add_bucket_info_to_redis(self.redis_client, data)
+                        
+                        self2.send_response(201)  # Created
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({
+                            "status": "success",
+                            "message": f"Bucket {data['name']} information submitted for review",
+                            "bucket": data['name']
+                        }).encode())
+                
+                    except json.JSONDecodeError:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({
+                            "error": "Invalid JSON payload"
+                        }).encode()) 
+
                 else:
                     self2.send_response(404)
                     self2.end_headers()
