@@ -225,6 +225,43 @@ def enable_bucket_notifications(redis_client, bucket_name):
     client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
     logger.info(f"Notifications enabled for bucket {bucket_name}")
 
+def add_bucket_info_to_redis(redis_client, bucket_info):
+    """Store bucket information in Redis for administrative review."""
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Create a Redis key based on bucket name
+    redis_key = f"linode:objstore:pending_buckets:{bucket_info['name']}"
+    
+    # Store the full information as JSON
+    client.set(redis_key, json.dumps(bucket_info))
+    
+    # Set a TTL (e.g., 7 days) so pending configs don't stay forever
+    client.expire(redis_key, 7 * 24 * 60 * 60)
+    
+    return True
+
+def get_pending_bucket_configs(redis_client):
+    """Get all pending bucket configurations from Redis."""
+    # Use slave for reads
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Get all pending bucket keys
+    pending_keys = client.keys("linode:objstore:pending_buckets:*")
+    
+    # Get the information for each key
+    pending_buckets = []
+    for key in pending_keys:
+        data = client.get(key)
+        if data:
+            try:
+                bucket_info = json.loads(data)
+                pending_buckets.append(bucket_info)
+            except json.JSONDecodeError:
+                continue
+                
+    return pending_buckets
+
 # State management functions
 def get_object_state(redis_client, config, bucket, key):
     """Get stored state for an object."""
