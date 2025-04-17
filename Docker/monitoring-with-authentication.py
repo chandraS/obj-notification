@@ -38,7 +38,10 @@ from utils import (
     check_sentinel_health,
     is_bucket_notifications_enabled,
     enable_bucket_notifications,
-    disable_bucket_notifications
+    disable_bucket_notifications,
+    generate_jwt_token,
+    validate_jwt_token,
+    validate_client_credentials
 )
 
 # Set up logging
@@ -669,47 +672,99 @@ class MultiRegionMonitor:
                 query_params = urllib.parse.parse_qs(parsed_url.query)
                 
                 if parsed_url.path == '/api/auth/token':
-                    # Handle token generation without authentication
-                    content_length = int(self2.headers['Content-Length'])
-                    post_data = self2.rfile.read(content_length)
+                    logger.info("Token request received")
                     try:
-                        data = json.loads(post_data.decode('utf-8'))
-                    except json.JSONDecodeError:
-                        self2.send_response(400)
+                        # Handle token generation without authentication
+                        content_length = int(self2.headers.get('Content-Length', 0))
+                        logger.debug(f"Content length: {content_length}")
+                        
+                        if content_length == 0:
+                            logger.error("No content provided in token request")
+                            self2.send_response(400)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({"error": "No content provided"}).encode())
+                            return
+                        
+                        post_data = self2.rfile.read(content_length)
+                        logger.debug(f"Raw data: {post_data}")
+                        
+                        try:
+                            data = json.loads(post_data.decode('utf-8'))
+                            logger.debug(f"Parsed data: {data}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON decode error: {e}")
+                            self2.send_response(400)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({"error": f"Invalid JSON: {str(e)}"}).encode())
+                            return
+                        
+                        client_id = data.get('client_id')
+                        client_secret = data.get('client_secret')
+                        
+                        logger.debug(f"Received client_id: {client_id}")
+                        # Don't log the actual secret, but log if it's present
+                        logger.debug(f"client_secret provided: {client_secret is not None}")
+                        
+                        if not client_id or not client_secret:
+                            logger.error("Missing credentials in token request")
+                            self2.send_response(400)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({"error": "Missing credentials", "message": "client_id and client_secret are required"}).encode())
+                            return
+                        
+                        # Validate credentials
+                        logger.debug("Validating credentials...")
+                        valid = validate_client_credentials(client_id, client_secret)
+                        logger.debug(f"Credentials valid: {valid}")
+                        
+                        if not valid:
+                            logger.error("Invalid credentials provided")
+                            self2.send_response(401)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({"error": "Invalid credentials"}).encode())
+                            return
+                        
+                        # Generate JWT token
+                        logger.debug("Generating token...")
+                        try:
+                            token = generate_jwt_token(client_id)
+                            logger.debug("Token generated successfully")
+                        except Exception as e:
+                            logger.error(f"Error generating token: {e}")
+                            self2.send_response(500)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({"error": f"Token generation failed: {str(e)}"}).encode())
+                            return
+                        
+                        # Send response
+                        logger.debug("Sending token response")
+                        self2.send_response(200)
                         self2.send_header('Content-Type', 'application/json')
                         self2.end_headers()
-                        self2.wfile.write(json.dumps({"error": "Invalid JSON in request"}).encode())
-                        return
-                    
-                    client_id = data.get('client_id')
-                    client_secret = data.get('client_secret')
-                    
-                    if not client_id or not client_secret:
-                        self2.send_response(400)
-                        self2.send_header('Content-Type', 'application/json')
-                        self2.end_headers()
-                        self2.wfile.write(json.dumps({"error": "Missing credentials", "message": "client_id and client_secret are required"}).encode())
-                        return
-                    
-                    # Validate credentials
-                    if not validate_client_credentials(client_id, client_secret):
-                        self2.send_response(401)
-                        self2.send_header('Content-Type', 'application/json')
-                        self2.end_headers()
-                        self2.wfile.write(json.dumps({"error": "Invalid credentials"}).encode())
-                        return
-                    
-                    # Generate JWT token
-                    token = generate_jwt_token(client_id)
-                    
-                    self2.send_response(200)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps({
-                        "access_token": token,
-                        "token_type": "Bearer",
-                        "expires_in": 86400  # 24 hours
-                    }).encode())
+                        response_data = {
+                            "access_token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 86400  # 24 hours
+                        }
+                        response_json = json.dumps(response_data)
+                        logger.debug(f"Response prepared: {len(response_json)} bytes")
+                        self2.wfile.write(response_json.encode())
+                        logger.info("Token response sent successfully")
+                        
+                    except Exception as e:
+                        logger.error(f"Unhandled exception in token endpoint: {e}", exc_info=True)
+                        try:
+                            self2.send_response(500)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({"error": f"Server error: {str(e)}"}).encode())
+                        except:
+                            logger.critical("Failed to send error response", exc_info=True)
                     
                 elif parsed_url.path == '/api/bucket-notifications/disable':
                     # Authenticate request
