@@ -28,7 +28,9 @@ from utils import (
     get_notifications,
     check_redis_health,
     check_queue_stats,
-    check_sentinel_health
+    check_sentinel_health,
+    OAuthTokenCache,
+    get_oauth_token
 )
 
 # Set up logging
@@ -103,6 +105,16 @@ class WebhookConsumer:
             reset_timeout=webhook_config.get("circuit_reset_time", 60)
         )
         
+        # Configure OAuth if enabled
+        oauth_config = self.config.get("oauth", {})
+        self.oauth_enabled = oauth_config.get("enabled", False)
+        if self.oauth_enabled:
+            self.client_id = oauth_config.get("client_id")
+            self.client_secret = oauth_config.get("client_secret")
+            self.token_url = oauth_config.get("token_url")
+            self.token_cache = OAuthTokenCache()
+            logger.info("OAuth authentication enabled for webhook delivery")
+        
         # Configure consumer settings
         consumer_config = self.config.get("consumer", {})
         self.polling_interval = consumer_config.get("polling_interval", 1)
@@ -117,6 +129,7 @@ class WebhookConsumer:
             "failed_deliveries": 0,
             "retries": 0,
             "circuit_breaks": 0,
+            "oauth_token_failures": 0,
             "start_time": time.time()
         }
         
@@ -148,12 +161,32 @@ class WebhookConsumer:
         # Add delivery timestamp
         message["delivery_attempt_time"] = datetime.now().isoformat()
         
+        # Set up headers
+        headers = {"Content-Type": "application/json"}
+        
+        # Add OAuth token if enabled
+        if self.oauth_enabled:
+            token = self.token_cache.get_token(
+                self.client_id, 
+                self.client_secret, 
+                self.token_url
+            )
+            
+            if token:
+                headers["Authorization"] = f"bearer {token}"
+                logger.debug("Added OAuth bearer token to request")
+            else:
+                logger.error("Failed to get OAuth token, cannot proceed with webhook delivery")
+                self.stats["oauth_token_failures"] += 1
+                self.circuit_breaker.record_failure()
+                return False
+        
         try:
             # Send to webhook
             response = requests.post(
                 self.webhook_url,
                 json=message,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 timeout=self.timeout
             )
             
@@ -184,6 +217,8 @@ class WebhookConsumer:
             return True
         else:
             self.stats["failed_deliveries"] += 1
+
+            message["retry_count"] = retry_count + 1
             
             # Check if we should retry
             if retry_count < self.max_retries:
@@ -192,7 +227,7 @@ class WebhookConsumer:
                 
                 logger.info(f"Will retry message for {message['bucket']}/{message['key']} "
                            f"after {backoff:.2f}s (attempt {retry_count+1}/{self.max_retries})")
-                
+                  
                 # Sleep for backoff period
                 time.sleep(backoff)
                 self.stats["retries"] += 1
@@ -251,12 +286,23 @@ class WebhookConsumer:
                     sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
                     webhook_ok = self.webhook_url is not None
                     
-                    status_code = 200 if (redis_ok and webhook_ok and sentinel_ok) else 503
+                    # For OAuth, check if we can get a token
+                    oauth_ok = True
+                    if self.oauth_enabled:
+                        token = self.token_cache.get_token(
+                            self.client_id,
+                            self.client_secret,
+                            self.token_url
+                        )
+                        oauth_ok = token is not None
+                    
+                    status_code = 200 if (redis_ok and webhook_ok and sentinel_ok and oauth_ok) else 503
                     ready_status = {
-                        "status": "ready" if (redis_ok and webhook_ok and sentinel_ok) else "not_ready",
+                        "status": "ready" if (redis_ok and webhook_ok and sentinel_ok and oauth_ok) else "not_ready",
                         "redis": "ok" if redis_ok else "error",
                         "sentinel": "ok" if sentinel_ok else "error",
-                        "webhook": "ok" if webhook_ok else "missing"
+                        "webhook": "ok" if webhook_ok else "missing",
+                        "oauth": "ok" if oauth_ok else "error" if self.oauth_enabled else "disabled"
                     }
                     self2.send_response(status_code)
                     self2.send_header('Content-Type', 'application/json')
@@ -277,6 +323,10 @@ class WebhookConsumer:
                         "circuit_breaker": {
                             "state": self.circuit_breaker.state,
                             "failures": self.circuit_breaker.failures
+                        },
+                        "oauth": {
+                            "enabled": self.oauth_enabled,
+                            "token_failures": self.stats.get("oauth_token_failures", 0)
                         }
                     }
                     
@@ -306,6 +356,10 @@ class WebhookConsumer:
         """Run the consumer in a continuous loop."""
         webhook_url_display = self.webhook_url if self.webhook_url else "not configured"
         logger.info(f"Starting webhook consumer, delivering to: {webhook_url_display}")
+        
+        # Log OAuth status
+        if self.oauth_enabled:
+            logger.info(f"OAuth authentication enabled, token URL: {self.token_url}")
         
         empty_polls = 0
         last_stats_time = time.time()
@@ -337,6 +391,9 @@ class WebhookConsumer:
                         f"retries {self.stats['retries']}, "
                         f"circuit breaks {self.stats['circuit_breaks']}"
                     )
+                    if self.oauth_enabled:
+                        logger.info(f"OAuth token failures: {self.stats.get('oauth_token_failures', 0)}")
+                        
                     last_stats_time = time.time()
                     
                     # Also check sentinel status periodically
