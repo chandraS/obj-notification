@@ -189,90 +189,69 @@ class BucketScanner(threading.Thread):
                     recent_threshold = 86400  # 24 hours in seconds
                     is_truly_new = is_missing_state and (current_time - object_modified <= recent_threshold)
                     
-                    # Process change if needed
-                    if is_truly_new or is_updated or is_missing_state:
-                        # Get object details
-                        details = {}
-                        try:
-                            details = s3_client.head_object(
-                                Bucket=bucket_name, 
-                                Key=object_key
-                            )
-                        except Exception as e:
-                            logger.error(f"Error getting details for {bucket_name}/{object_key}: {e}")
-                            stats["errors"] += 1
+                    # Determine appropriate event type
+                    if is_truly_new:
+                        event_type = "created"
+                    elif is_missing_state:
+                        # Object is not recent but missing state - likely state expired
+                        event_type = "detected"
+                    elif is_updated:
+                        event_type = "updated"
+                    else:
+                        # No change detected, skip
+                        continue
                     
-                        # Determine S3 operation type based on object characteristics
-                        if is_truly_new or is_updated:
-                            # Default operation is PUT for simple uploads
-                            operation_type = "PUT"
+                    # Process change
+                    # Get object details (only if needed)
+                    details = {}
+                    try:
+                        details = s3_client.head_object(
+                            Bucket=bucket_name, 
+                            Key=object_key
+                        )
+                    except Exception as e:
+                        logger.error(f"Error getting details for {bucket_name}/{object_key}: {e}")
+                        stats["errors"] += 1
+                    
+                    # Create notification message
+                    message = {
+                        "bucket": bucket_name,
+                        "key": object_key,
+                        "region": endpoint,
+                        "etag": object_etag,
+                        "size": obj["Size"],
+                        "last_modified": object_modified,
+                        "event_type": event_type,
+                        "content_type": details.get("ContentType", "application/octet-stream"),
+                        "metadata": details.get("Metadata", {}),
+                        "detection_time": scan_time,
+                        "is_recent": current_time - object_modified <= recent_threshold,
+                        "retry_count": 0
+                    }
+                    
+                    # Check if notifications are enabled for this bucket
+                    if is_bucket_notifications_enabled(self.redis_client, bucket_name):
+                        # Publish to queue
+                        if publish_notification(self.redis_client, self.global_config, message):
+                            # Update state after successful queue publish
+                            save_object_state(self.redis_client, self.global_config, bucket_name, object_key, {
+                                "etag": object_etag,
+                                "last_modified": object_modified,
+                                "size": obj["Size"],
+                                "last_processed": scan_time
+                            })
                             
-                            # Check for multipart upload - indicated by specific ETag format or large size
-                            # ETag for multipart uploads typically contains a dash followed by a part number
-                            if "-" in object_etag or obj["Size"] > 5242880:  # 5MB - typical multipart threshold
-                                operation_type = "MULTIPART_UPLOAD"
-                            
-                            # Check for POST operation (typically form uploads)
-                            elif details.get("ContentType", "").startswith("multipart/form-data") or \
-                                "x-amz-post-form" in details.get("Metadata", {}):
-                                operation_type = "POST"
-                            
-                            # Check for COPY operation
-                            elif details.get("Metadata", {}).get("x-amz-copy-source"):
-                                operation_type = "COPY"
-                            
-                            # Determine final event type
-                            if is_truly_new:
-                                event_type = f"{operation_type}_CREATE"
-                            else:
-                                event_type = f"{operation_type}_UPDATE"
+                            # Update statistics based on event type
+                            if event_type == "created":
+                                stats["new_objects"] += 1
+                            elif event_type == "updated":
+                                stats["updated_objects"] += 1
+                            elif event_type == "detected":
+                                stats["detected_objects"] += 1
                         else:
-                            # For detected objects (missing state but not recent)
-                            event_type = "DETECT"
-                            operation_type = "DETECT"
-                    
-                    
-                        # Create notification message
-                        message = {
-                            "bucket": bucket_name,
-                            "key": object_key,
-                            "region": endpoint,
-                            "etag": object_etag,
-                            "size": obj["Size"],
-                            "last_modified": object_modified,
-                            "event_type": event_type,
-                            "basic_event": "created" if is_truly_new else ("updated" if is_updated else "detected"),
-                            "operation": operation_type,
-                            "content_type": details.get("ContentType", "application/octet-stream"),
-                            "metadata": details.get("Metadata", {}),
-                            "detection_time": scan_time,
-                            "is_recent": current_time - object_modified <= recent_threshold,
-                            "retry_count": 0  # Explicitly set to 0
-                        }
-                    
-                        # Check if notifications are enabled for this bucket
-                        if is_bucket_notifications_enabled(self.redis_client, bucket_name):
-                            # Publish to queue
-                            if publish_notification(self.redis_client, self.global_config, message):
-                                # Update state after successful queue publish
-                                save_object_state(self.redis_client, self.global_config, bucket_name, object_key, {
-                                    "etag": object_etag,
-                                    "last_modified": object_modified,
-                                    "size": obj["Size"],
-                                    "last_processed": scan_time
-                                })
-                                
-                                # Update statistics based on event type
-                                if event_type == "created":
-                                    stats["new_objects"] += 1
-                                elif event_type == "updated":
-                                    stats["updated_objects"] += 1
-                                elif event_type == "detected":
-                                    stats["detected_objects"] += 1
-                            else:
-                                logger.debug(f"Failed to publish notification for {bucket_name}/{object_key}")
-                        else:
-                            logger.debug(f"Skipping notification for {bucket_name}/{object_key} (notifications disabled)")
+                            logger.debug(f"Failed to publish notification for {bucket_name}/{object_key}")
+                    else:
+                        logger.debug(f"Skipping notification for {bucket_name}/{object_key} (notifications disabled)")
             
             # Update last scan time
             # Use redis master explicitly for this write operation
