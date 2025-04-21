@@ -11,9 +11,6 @@ import time
 import yaml
 import redis
 import jwt
-import requests
-import base64
-import threading
 from redis.sentinel import Sentinel
 from datetime import datetime, timedelta
 
@@ -82,21 +79,6 @@ def load_config():
         if "webhook" not in config:
             config["webhook"] = {}
         config["webhook"]["url"] = os.environ["WEBHOOK_URL"]
-    
-    # OAuth configuration from environment
-    if "OAUTH_ENABLED" in os.environ and os.environ["OAUTH_ENABLED"].lower() == "true":
-        if "oauth" not in config:
-            config["oauth"] = {}
-        config["oauth"]["enabled"] = True
-        
-        if "OAUTH_TOKEN_URL" in os.environ:
-            config["oauth"]["token_url"] = os.environ["OAUTH_TOKEN_URL"]
-            
-        if "OAUTH_CLIENT_ID" in os.environ:
-            config["oauth"]["client_id"] = os.environ["OAUTH_CLIENT_ID"]
-            
-        if "OAUTH_CLIENT_SECRET" in os.environ:
-            config["oauth"]["client_secret"] = os.environ["OAUTH_CLIENT_SECRET"]
     
     return config
 
@@ -179,63 +161,6 @@ def create_redis_client(config):
         except Exception as fallback_error:
             logger.error(f"Fallback Redis connection also failed: {fallback_error}")
             raise
-
-# OAuth functions
-def get_oauth_token(client_id, client_secret, token_url):
-    """Get OAuth token using client credentials grant."""
-    
-    # Create Basic Auth header by encoding client_id:client_secret in base64
-    auth_string = f"{client_id}:{client_secret}"
-    encoded_auth = base64.b64encode(auth_string.encode()).decode()
-    
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": f"Basic {encoded_auth}"
-    }
-    
-    data = {
-        "grant_type": "client_credentials"
-    }
-    
-    try:
-        response = requests.post(token_url, headers=headers, data=data, timeout=10)
-        if response.status_code == 200:
-            token_data = response.json()
-            return token_data.get("access_token"), token_data.get("expires_in", 3600)
-        else:
-            logger.error(f"Failed to get OAuth token: {response.status_code} - {response.text}")
-            return None, 0
-    except Exception as e:
-        logger.error(f"Error getting OAuth token: {e}")
-        return None, 0
-
-class OAuthTokenCache:
-    """Cache for OAuth tokens to prevent frequent authentication."""
-    
-    def __init__(self):
-        self.token = None
-        self.expiry_time = 0
-        self.lock = threading.Lock()
-    
-    def get_token(self, client_id, client_secret, token_url):
-        """Get a valid token, refreshing if necessary."""
-        current_time = time.time()
-        
-        with self.lock:
-            # Check if we have a valid token
-            if self.token and current_time < self.expiry_time:
-                return self.token
-            
-            # Get a new token
-            token, expires_in = get_oauth_token(client_id, client_secret, token_url)
-            
-            if token:
-                # Store token with expiry (subtract 60 seconds for safety margin)
-                self.token = token
-                self.expiry_time = current_time + expires_in - 60
-                return token
-            
-            return None
 
 # JWT Authentication functions
 def generate_jwt_token(client_id, expiry_hours=24):
