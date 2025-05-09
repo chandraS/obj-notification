@@ -39,11 +39,13 @@ from utils import (
     is_bucket_notifications_enabled,
     enable_bucket_notifications,
     disable_bucket_notifications,
+    get_pending_bucket_configs,
+    save_bucket_config,
+    add_bucket_info_to_redis,
+    get_bucket_webhook_url,
     generate_jwt_token,
     validate_jwt_token,
-    validate_client_credentials,
-    get_pending_bucket_configs,
-    add_bucket_info_to_redis
+    validate_client_credentials
 )
 
 # Set up logging
@@ -288,6 +290,9 @@ class MultiRegionMonitor:
         """Initialize the monitor with configuration."""
         self.config = load_config()
         self.redis_client = create_redis_client(self.config)
+
+        self.refresh_config_from_redis()
+
         self.client_cache = S3ClientCache()
         
         # Track last scan times for each bucket
@@ -322,6 +327,32 @@ class MultiRegionMonitor:
             "last_scan_time": 0,
             "scan_durations": []  # Last 10 scan durations
         }
+
+    def refresh_config_from_redis(self):
+        """Refresh in-memory configuration from Redis."""
+        logger.info("Refreshing configuration from Redis")
+        
+        client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+        all_bucket_keys = client.keys("linode:objstore:config:bucket:*")
+        
+        # Create a new buckets array
+        new_buckets = []
+        
+        # Populate from Redis
+        for key in all_bucket_keys:
+            bucket_data = client.get(key)
+            if bucket_data:
+                try:
+                    if isinstance(bucket_data, bytes):
+                        bucket_data = bucket_data.decode('utf-8')
+                    bucket_config = json.loads(bucket_data)
+                    new_buckets.append(bucket_config)
+                except json.JSONDecodeError:
+                    logger.error(f"Error decoding JSON from Redis for key {key}")
+        
+        # Update the in-memory config
+        self.config["buckets"] = new_buckets
+        logger.info(f"Refreshed configuration from Redis: {len(new_buckets)} buckets loaded")
     
     def handle_signal(self, signum, frame):
         """Handle termination signals."""
@@ -402,6 +433,7 @@ class MultiRegionMonitor:
         
         for region in self.get_all_regions():
             logger.info(f"Initializing thread pool for region {region} with {rate_limit_per_region} workers")
+
             self.region_thread_pools[region] = ThreadPoolExecutor(max_workers=rate_limit_per_region)
     
     def get_all_regions(self):
@@ -564,6 +596,175 @@ class MultiRegionMonitor:
             self.scan_stats["total_new_objects"] += result.get("new_objects", 0)
             self.scan_stats["total_updated_objects"] += result.get("updated_objects", 0)
             self.scan_stats["total_detected_objects"] += result.get("detected_objects", 0)
+
+    def add_bucket_to_active_config(self, bucket_info):
+        """Add a new bucket to the active configuration."""
+        try:
+            logger.info(f"Starting to add bucket: {bucket_info.get('name')}")
+            # Format the bucket info correctly
+
+            logger.info(f"Input bucket_info keys: {list(bucket_info.keys())}")
+
+            bucket_config = bucket_info.copy()
+
+            #logger.info(f"Has client_id: {'client_id' in bucket_info}, Value: {bucket_info.get('client_id', 'None')}")
+            #logger.info(f"Has client_secret: {'client_secret' in bucket_info}, Value: {'<present>' if 'client_secret' in bucket_info else 'None'}")
+            #logger.info(f"Has token_url: {'token_url' in bucket_info}, Value: {bucket_info.get('token_url', 'None')}")
+
+            """bucket_config = {
+                "name": bucket_info["name"],
+                "access_key": bucket_info["access_key"],
+                "secret_key": bucket_info["secret_key"],
+                "endpoint": bucket_info.get("region", bucket_info.get("endpoint")),
+                "webhook_url": bucket_info["webhook_url"],
+                "status": "active",
+                "added_at": datetime.now().isoformat()
+            }"""
+
+
+            
+            # Add authentication details if provided
+            """
+            if "client_id" in bucket_info and "client_secret" in bucket_info and "token_url" in bucket_info:
+                bucket_config["webhook_auth"] = {
+                    "type": "oauth2",
+                    "client_id": bucket_info["client_id"],
+                    "client_secret": bucket_info["client_secret"],
+                    "token_url": bucket_info.get("token_url")
+                }"""
+            # Add authentication details if provided - SIMPLIFIED APPROACH
+            if "client_id" in bucket_info:
+                # Initialize webhook_auth if not present
+                if "webhook_auth" not in bucket_config:
+                    bucket_config["webhook_auth"] = {"type": "oauth2"}
+
+                bucket_config["webhook_auth"]["client_id"] = bucket_info["client_id"]
+
+            if "client_secret" in bucket_info:
+                # Initialize webhook_auth if not present
+                if "webhook_auth" not in bucket_config:
+                    bucket_config["webhook_auth"] = {"type": "oauth2"}
+
+                bucket_config["webhook_auth"]["client_secret"] = bucket_info["client_secret"]
+
+            if "token_url" in bucket_info:
+                # Initialize webhook_auth if not present
+                if "webhook_auth" not in bucket_config:
+                    bucket_config["webhook_auth"] = {"type": "oauth2"}
+
+                bucket_config["webhook_auth"]["token_url"] = bucket_info["token_url"]
+
+            # Log the final bucket config before saving
+            logger.info(f"Final bucket config before Redis save: {json.dumps(bucket_config, default=str)}")
+            
+            # Add to Redis for persistence (NO TTL)
+            logger.info(f"Saving bucket config to Redis: {bucket_config.get('name')}")
+            redis_result = save_bucket_config(self.redis_client, bucket_config)
+
+            if not redis_result:
+                logger.error(f"Failed to save bucket config to Redis: {bucket_config.get('name')}")
+                return False
+            
+            # Add to in-memory configuration
+            logger.info(f"Adding bucket to in-memory config: {bucket_config.get('name')}")
+            self.config.setdefault("buckets", []).append(bucket_config)
+            
+            # Initialize scan metadata for this bucket
+            logger.info(f"Initializing scan metadata for bucket: {bucket_config.get('name')}")
+            polling_interval = self.config.get("defaults", {}).get("polling_interval", 60)
+            self.bucket_offsets[bucket_config["name"]] = random.randint(0, polling_interval - 1)
+            #self.bucket_offsets[bucket_info["name"]] = random.randint(
+             #   0, self.config.get("defaults", {}).get("polling_interval", 60) - 1
+            #)
+            
+            # If the bucket's region is new, create a thread pool for it
+            endpoint = bucket_config["endpoint"]
+            logger.info(f"Checking thread pool for region: {endpoint}")
+            if endpoint not in self.region_thread_pools:
+                rate_limit = self.config.get("parallel", {}).get("rate_limit_per_region", 15)
+                self.region_thread_pools[endpoint] = ThreadPoolExecutor(max_workers=rate_limit)
+                logger.info(f"Created new thread pool for region {endpoint}")
+            
+            logger.info(f"Added new bucket {bucket_config['name']} to active configuration")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding bucket to active configuration: {e}", exc_info=True)
+            return False
+        
+    def update_bucket_config(self, bucket_info):
+        """Update an existing bucket configuration."""
+        try:
+            bucket_name = bucket_info["name"]
+            
+            # Find existing bucket in memory
+            bucket_found = False
+            for i, bucket in enumerate(self.config.get("buckets", [])):
+                if bucket["name"] == bucket_name:
+                    bucket_found = True
+                    
+                    # Update fields that are present in the request
+                    if "access_key" in bucket_info:
+                        self.config["buckets"][i]["access_key"] = bucket_info["access_key"]
+                    if "secret_key" in bucket_info:
+                        self.config["buckets"][i]["secret_key"] = bucket_info["secret_key"]
+                    if "region" in bucket_info:
+                        self.config["buckets"][i]["endpoint"] = bucket_info["region"]
+                    elif "endpoint" in bucket_info:
+                        self.config["buckets"][i]["endpoint"] = bucket_info["endpoint"]
+                    if "webhook_url" in bucket_info:
+                        self.config["buckets"][i]["webhook_url"] = bucket_info["webhook_url"]
+                    
+                    # Update authentication if provided
+                    if "client_id" in bucket_info and "client_secret" in bucket_info:
+                        self.config["buckets"][i]["webhook_auth"] = {
+                            "type": "oauth2",
+                            "client_id": bucket_info["client_id"],
+                            "client_secret": bucket_info["client_secret"],
+                            "token_url": bucket_info.get("token_url")
+                        }
+                    
+                    # Save to Redis
+                    save_bucket_config(self.redis_client, self.config["buckets"][i])
+                    
+                    # If endpoint changed, clear client cache
+                    if "region" in bucket_info or "endpoint" in bucket_info:
+                        self.client_cache.clear_cache()
+                    
+                    logger.info(f"Updated configuration for bucket {bucket_name}")
+                    break
+            
+            return bucket_found
+            
+        except Exception as e:
+            logger.error(f"Error updating bucket configuration: {e}")
+            return False
+            
+    def delete_bucket_config(self, bucket_name):
+        """Delete a bucket from the configuration."""
+        try:
+            # Find and remove from in-memory config
+            self.config["buckets"] = [b for b in self.config.get("buckets", []) if b["name"] != bucket_name]
+            
+            # Remove from Redis
+            client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+            client.delete(f"linode:objstore:config:bucket:{bucket_name}")
+            
+            # Clean up any state associated with this bucket
+            client.delete(f"linode:objstore:last_scan:{bucket_name}")
+            client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
+            
+            # Clean up offset
+            if bucket_name in self.bucket_offsets:
+                del self.bucket_offsets[bucket_name]
+            
+            logger.info(f"Deleted bucket {bucket_name} from configuration")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting bucket configuration: {e}")
+            return False
+
     
     def start_health_server(self):
         """Start a simple HTTP server for health checks and API."""
@@ -593,7 +794,7 @@ class MultiRegionMonitor:
                     return None
                 
                 return payload
-                
+            
             def do_GET(self2):
                 if self2.path == '/health':
                     # Basic health check
@@ -642,33 +843,33 @@ class MultiRegionMonitor:
                     self2.wfile.write(json.dumps(metrics).encode())
                 
                 elif self2.path == '/api/bucket-notifications/status':
+
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
                         return
                     
+                    self.refresh_config_from_redis()
+                    
                     # Get notification status for all buckets
-                    statuses = {}
+                    statuses = []
                     for bucket_config in self.config.get("buckets", []):
                         bucket_name = bucket_config["name"]
                         enabled = is_bucket_notifications_enabled(self.redis_client, bucket_name)
-                        statuses[bucket_name] = {
+                        webhook_url = bucket_config.get("webhook_url", "Not configured")
+                        statuses.append({
                             "name": bucket_name,
-                            "notifications_enabled": enabled
-                        }
+                            "notifications_enabled": enabled,
+                            "webhook_url": webhook_url
+                        })
                     
                     self2.send_response(200)
                     self2.send_header('Content-Type', 'application/json')
                     self2.send_header('Access-Control-Allow-Origin', '*')
                     self2.end_headers()
-                    self2.wfile.write(json.dumps({"buckets": list(statuses.values())}).encode())
+                    self2.wfile.write(json.dumps({"buckets": statuses}).encode())
 
                 elif self2.path == '/api/buckets/pending':
-                    # Authenticate request
-                    payload = self2.authenticate_request()
-                    if not payload:
-                        return
-                    
                     # Get pending bucket configurations
                     pending_buckets = get_pending_bucket_configs(self.redis_client)
                     
@@ -689,7 +890,7 @@ class MultiRegionMonitor:
                 
                 parsed_url = urllib.parse.urlparse(self2.path)
                 query_params = urllib.parse.parse_qs(parsed_url.query)
-                
+
                 if parsed_url.path == '/api/auth/token':
                     logger.info("Token request received")
                     try:
@@ -784,8 +985,10 @@ class MultiRegionMonitor:
                             self2.wfile.write(json.dumps({"error": f"Server error: {str(e)}"}).encode())
                         except:
                             logger.critical("Failed to send error response", exc_info=True)
-                    
-                elif parsed_url.path == '/api/bucket-notifications/disable':
+
+                
+                if parsed_url.path == '/api/bucket-notifications/disable':
+
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -825,6 +1028,7 @@ class MultiRegionMonitor:
                     }).encode())
                     
                 elif parsed_url.path == '/api/bucket-notifications/enable':
+
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -863,7 +1067,9 @@ class MultiRegionMonitor:
                         "notifications": "enabled"
                     }).encode())
 
-                elif parsed_url.path == '/api/buckets/add-pending':
+                # Add a new bucket
+                elif parsed_url.path == '/api/buckets/add':
+
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -877,7 +1083,7 @@ class MultiRegionMonitor:
                         data = json.loads(post_data.decode('utf-8'))
                         
                         # Validate required fields
-                        required_fields = ['name', 'access_key', 'secret_key', 'region', 'webhook_url']
+                        required_fields = ['name', 'access_key', 'secret_key', 'webhook_url']
                         for field in required_fields:
                             if field not in data:
                                 self2.send_response(400)
@@ -888,21 +1094,168 @@ class MultiRegionMonitor:
                                 }).encode())
                                 return
                         
-                        # Add submission timestamp
-                        data['submitted_at'] = datetime.now().isoformat()
+                        # Check if region or endpoint is provided
+                        if 'region' not in data and 'endpoint' not in data:
+                            self2.send_response(400)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "error": "Either 'region' or 'endpoint' field is required"
+                            }).encode())
+                            return
                         
-                        # Store in Redis for admin review
-                        add_bucket_info_to_redis(self.redis_client, data)
+                        # Check if bucket already exists
+                        bucket_exists = any(b["name"] == data["name"] for b in self.config.get("buckets", []))
+                        if bucket_exists:
+                            self2.send_response(409)  # Conflict
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "error": f"Bucket {data['name']} already exists"
+                            }).encode())
+                            return
+                            
+                        # Create the bucket configuration
+                        bucket_config = {
+                            "name": data["name"],
+                            "access_key": data["access_key"],
+                            "secret_key": data["secret_key"],
+                            "endpoint": data.get("region", data.get("endpoint")),
+                            "webhook_url": data["webhook_url"],
+                            "status": "active",
+                            "added_at": datetime.now().isoformat()
+                        }
                         
-                        self2.send_response(201)  # Created
+                        # Add authentication if provided
+                        if "client_id" in data and "client_secret" in data and "token_url" in data:
+                            bucket_config["webhook_auth"] = {
+                                "type": "oauth2",
+                                "client_id": data["client_id"],
+                                "client_secret": data["client_secret"],
+                                "token_url": data.get("token_url")
+                            }
+                        
+                        # Add to active configuration
+                        success = self.add_bucket_to_active_config(bucket_config)
+
+                        if success:
+                            # Refresh from Redis to ensure consistency
+                            self.refresh_config_from_redis()
+                        
+                        if success:
+                            self2.send_response(201)  # Created
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "status": "success",
+                                "message": f"Bucket {data['name']} added to active configuration",
+                                "bucket": data['name']
+                            }).encode())
+                        else:
+                            self2.send_response(500)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "status": "error",
+                                "message": "Failed to add bucket to active configuration"
+                            }).encode())
+                    
+                    except json.JSONDecodeError:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({
+                            "error": "Invalid JSON payload"
+                        }).encode())
+
+                # Update an existing bucket
+                elif parsed_url.path == '/api/buckets/update':
+
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
+                    
+                    # Parse request body
+                    content_length = int(self2.headers['Content-Length'])
+                    post_data = self2.rfile.read(content_length)
+                    
+                    try:
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        # Validate required fields
+                        if 'name' not in data:
+                            self2.send_response(400)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "error": "Missing required field: name"
+                            }).encode())
+                            return
+                        
+                        # Find existing bucket
+                        bucket_name = data['name']
+                        bucket_exists = False
+                        
+                        for i, bucket in enumerate(self.config.get("buckets", [])):
+                            if bucket["name"] == bucket_name:
+                                bucket_exists = True
+                                
+                                # Update standard fields if present
+                                if "access_key" in data:
+                                    self.config["buckets"][i]["access_key"] = data["access_key"]
+                                if "secret_key" in data:
+                                    self.config["buckets"][i]["secret_key"] = data["secret_key"]
+                                if "region" in data:
+                                    self.config["buckets"][i]["endpoint"] = data["region"]
+                                elif "endpoint" in data:
+                                    self.config["buckets"][i]["endpoint"] = data["endpoint"]
+                                if "webhook_url" in data:
+                                    self.config["buckets"][i]["webhook_url"] = data["webhook_url"]
+                                
+                                # Update authentication details if provided
+                                if "client_id" in data and "client_secret" in data:
+                                    # Create or update webhook_auth section
+                                    self.config["buckets"][i]["webhook_auth"] = {
+                                        "type": "oauth2",
+                                        "client_id": data["client_id"],
+                                        "client_secret": data["client_secret"]
+                                    }
+                                    # Add token URL if provided
+                                    if "token_url" in data:
+                                        self.config["buckets"][i]["webhook_auth"]["token_url"] = data["token_url"]
+                                
+                                # Mark update time
+                                self.config["buckets"][i]["updated_at"] = datetime.now().isoformat()
+                                
+                                # Save to Redis
+                                save_bucket_config(self.redis_client, self.config["buckets"][i])
+
+                                self.refresh_config_from_redis()
+                                
+                                # If endpoint changed, clear client cache
+                                if "region" in data or "endpoint" in data:
+                                    self.client_cache.clear_cache()
+                                
+                                break
+                        
+                        if not bucket_exists:
+                            self2.send_response(404)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "error": f"Bucket {bucket_name} not found"
+                            }).encode())
+                            return
+                        
+                        self2.send_response(200)
                         self2.send_header('Content-Type', 'application/json')
                         self2.end_headers()
                         self2.wfile.write(json.dumps({
                             "status": "success",
-                            "message": f"Bucket {data['name']} information submitted for review",
-                            "bucket": data['name']
+                            "message": f"Bucket {bucket_name} updated"
                         }).encode())
-                
+                    
                     except json.JSONDecodeError:
                         self2.send_response(400)
                         self2.send_header('Content-Type', 'application/json')
@@ -910,6 +1263,58 @@ class MultiRegionMonitor:
                         self2.wfile.write(json.dumps({
                             "error": "Invalid JSON payload"
                         }).encode()) 
+
+                elif parsed_url.path == '/api/buckets/delete':
+
+                    # Authenticate request
+                    payload = self2.authenticate_request()
+                    if not payload:
+                        return
+                    
+                    # Get bucket parameter
+                    bucket_name = query_params.get('bucket', [None])[0]
+                    
+                    if not bucket_name:
+                        self2.send_response(400)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Missing bucket parameter"}).encode())
+                        return
+                    
+                    # Check if bucket exists
+                    bucket_exists = any(b["name"] == bucket_name for b in self.config.get("buckets", []))
+                    if not bucket_exists:
+                        self2.send_response(404)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({"error": "Bucket not found"}).encode())
+                        return
+                    
+                    # Delete bucket from configuration
+                    self.config["buckets"] = [b for b in self.config.get("buckets", []) if b["name"] != bucket_name]
+                    
+                    # Delete from Redis
+                    client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+                    #redis_key = f"linode:objstore:bucket_config:{bucket_name}"
+                    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+                    client.delete(redis_key)
+                    
+                    # Clean up any state associated with this bucket
+                    #client.delete(f"linode:objstore:last_scan:{bucket_name}")
+                    #client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
+
+                    client.delete(f"linode:objstore:last_scan:{bucket_name}")
+                    client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
+
+                    self.refresh_config_from_redis()
+                    
+                    self2.send_response(200)
+                    self2.send_header('Content-Type', 'application/json')
+                    self2.end_headers()
+                    self2.wfile.write(json.dumps({
+                        "status": "success",
+                        "message": f"Bucket {bucket_name} deleted"
+                    }).encode())        
 
                 else:
                     self2.send_response(404)
