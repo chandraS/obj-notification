@@ -6,11 +6,14 @@ With Redis Sentinel support for high availability.
 
 import json
 import logging
+import base64
+import requests
 import os
 import time
 import yaml
-import redis
 import jwt
+import redis
+from datetime import datetime, timedelta
 from redis.sentinel import Sentinel
 from datetime import datetime, timedelta
 
@@ -162,6 +165,110 @@ def create_redis_client(config):
             logger.error(f"Fallback Redis connection also failed: {fallback_error}")
             raise
 
+# OAuth token cache
+oauth_token_cache = {}
+
+# Default OAuth token URL (same for all webhooks)
+#DEFAULT_OAUTH_TOKEN_URL = "https://oauth/token"
+
+def get_oauth_token(client_id, client_secret, token_url):
+    """Get OAuth token using client credentials grant.
+    
+    Args:
+        client_id: OAuth client ID
+        client_secret: OAuth client secret
+        token_url: OAuth token endpoint URL
+        
+    Returns:
+        str: OAuth access token or None if failed
+    """
+    if not token_url:
+        logger.error("No token URL provided for OAuth authentication")
+        return None
+        
+    cache_key = f"{client_id}:{token_url}"
+    
+    # Check cache first
+    current_time = time.time()
+    if cache_key in oauth_token_cache:
+        token_data = oauth_token_cache[cache_key]
+        # Check if token is still valid (with 5-minute buffer)
+        if current_time < token_data["expires_at"] - 300:  # 5-minute buffer
+            logger.debug(f"Using cached OAuth token for {client_id}")
+            return token_data["access_token"]
+    
+    try:
+        # Prepare Basic Auth header
+        auth_str = f"{client_id}:{client_secret}"
+        auth_bytes = auth_str.encode('ascii')
+        base64_bytes = base64.b64encode(auth_bytes)
+        base64_auth = base64_bytes.decode('ascii')
+        
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {base64_auth}"
+        }
+        
+        data = {
+            "grant_type": "client_credentials"
+        }
+        
+        logger.debug(f"Requesting OAuth token from {token_url}")
+        response = requests.post(token_url, headers=headers, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            access_token = token_data.get("access_token")
+            expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+            
+            # Cache the token with expiration time
+            oauth_token_cache[cache_key] = {
+                "access_token": access_token,
+                "expires_at": current_time + expires_in
+            }
+            
+            logger.info(f"Successfully obtained OAuth token for {client_id}")
+            return access_token
+        else:
+            logger.error(f"Failed to obtain OAuth token: {response.status_code}, {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error obtaining OAuth token for {client_id}: {e}")
+        return None
+
+def clear_oauth_token_cache(client_id=None, token_url=None):
+    """Clear OAuth token cache for specific client or all clients."""
+    global oauth_token_cache
+    
+    if client_id and token_url:
+        cache_key = f"{client_id}:{token_url}"
+        if cache_key in oauth_token_cache:
+            del oauth_token_cache[cache_key]
+            logger.debug(f"Cleared OAuth token cache for {client_id} and {token_url}")
+    else:
+        oauth_token_cache = {}
+        logger.debug("Cleared all OAuth token cache")
+
+# Get webhook URL for a specific bucket
+def get_bucket_webhook_url(redis_client, config, bucket_name):
+    """Get the webhook URL for a specific bucket."""
+    # Check if we have a bucket-specific webhook URL in Redis
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Try to get from Redis first (for dynamic updates)
+    webhook_url = client.get(f"linode:objstore:config:{bucket_name}:webhook_url")
+    
+    # If not in Redis, check bucket configs
+    if not webhook_url:
+        for bucket in config.get("buckets", []):
+            if bucket["name"] == bucket_name:
+                webhook_url = bucket.get("webhook_url")
+                if webhook_url:
+                    break
+    
+    return webhook_url
+
 # JWT Authentication functions
 def generate_jwt_token(client_id, expiry_hours=24):
     """Generate a JWT token for the given client_id."""
@@ -199,6 +306,7 @@ def validate_client_credentials(client_id, client_secret):
     expected_client_secret = os.environ.get('API_CLIENT_SECRET', 'default-client-secret')
     
     return client_id == expected_client_id and client_secret == expected_client_secret
+
 
 # Bucket notification status functions
 def is_bucket_notifications_enabled(redis_client, bucket_name):
@@ -420,3 +528,73 @@ def check_queue_stats(redis_client, config):
     except Exception as e:
         logger.error(f"Error getting queue stats: {e}")
         return {"error": str(e)}
+    
+# Functions for storing configuration (NO TTL)
+def save_bucket_config(redis_client, bucket_config):
+    """Save bucket configuration to Redis with NO TTL."""
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    bucket_name = bucket_config["name"]
+    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+    
+    # Store as JSON without TTL
+    client.set(redis_key, json.dumps(bucket_config))
+    logger.info(f"Saved bucket configuration for {bucket_name} to Redis (persistent)")
+    return True
+
+def get_bucket_config(redis_client, bucket_name):
+    """Get bucket configuration from Redis."""
+    # Use slave for reads when available
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+    config_json = client.get(redis_key)
+    
+    if config_json:
+        try:
+            return json.loads(config_json)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON in Redis for {redis_key}")
+    
+    return None
+
+def load_bucket_configs(redis_client):
+    """Load all bucket configurations from Redis."""
+    # Use slave for reads when available
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Get all bucket configurations
+    bucket_keys = client.keys("linode:objstore:config:bucket:*")
+    bucket_configs = []
+    
+    for key in bucket_keys:
+        config_json = client.get(key)
+        if config_json:
+            try:
+                bucket_config = json.loads(config_json)
+                bucket_configs.append(bucket_config)
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in Redis for {key}")
+    
+    return bucket_configs
+
+# Functions for object state WITH TTL
+def save_object_state(redis_client, config, bucket, key, state):
+    """Save state for an object with TTL."""
+    state_prefix = config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
+    redis_key = f"{state_prefix}{bucket}:{key}"
+    
+    # Get TTL from config or use default (30 days)
+    ttl = config.get("redis", {}).get("ttl", 2592000)
+    
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    try:
+        # Set with expiration to prevent unlimited growth
+        client.setex(redis_key, ttl, json.dumps(state))
+        return True
+    except Exception as e:
+        logger.error(f"Error saving state to Redis for {redis_key}: {e}")
+        return False
