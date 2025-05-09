@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Webhook Consumer for Linode Object Storage Monitor
 
@@ -12,6 +12,7 @@ Supports Redis Sentinel for high availability.
 import json
 import os
 import time
+import base64
 import threading
 import http.server
 import socketserver
@@ -29,7 +30,9 @@ from utils import (
     check_redis_health,
     check_queue_stats,
     check_sentinel_health,
-    OAuthTokenCache,
+    get_bucket_webhook_url,
+    get_bucket_config,
+    clear_oauth_token_cache,
     get_oauth_token
 )
 
@@ -91,29 +94,12 @@ class WebhookConsumer:
         
         # Configure webhook settings
         webhook_config = self.config.get("webhook", {})
-        self.webhook_url = webhook_config.get("url")
-        if not self.webhook_url and "WEBHOOK_URL" in os.environ:
-            self.webhook_url = os.environ["WEBHOOK_URL"]
-            
         self.timeout = webhook_config.get("timeout", 10)
         self.max_retries = webhook_config.get("max_retries", 3)
         self.backoff_factor = webhook_config.get("backoff_factor", 2)
         
-        # Create circuit breaker
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=webhook_config.get("circuit_threshold", 5),
-            reset_timeout=webhook_config.get("circuit_reset_time", 60)
-        )
-        
-        # Configure OAuth if enabled
-        oauth_config = self.config.get("oauth", {})
-        self.oauth_enabled = oauth_config.get("enabled", False)
-        if self.oauth_enabled:
-            self.client_id = oauth_config.get("client_id")
-            self.client_secret = oauth_config.get("client_secret")
-            self.token_url = oauth_config.get("token_url")
-            self.token_cache = OAuthTokenCache()
-            logger.info("OAuth authentication enabled for webhook delivery")
+        # Create circuit breakers dictionary (one per webhook URL)
+        self.circuit_breakers = {}
         
         # Configure consumer settings
         consumer_config = self.config.get("consumer", {})
@@ -129,7 +115,6 @@ class WebhookConsumer:
             "failed_deliveries": 0,
             "retries": 0,
             "circuit_breaks": 0,
-            "oauth_token_failures": 0,
             "start_time": time.time()
         }
         
@@ -147,14 +132,35 @@ class WebhookConsumer:
             logger.warning(f"Redis Sentinel not available: {sentinel_status.get('error')}")
     
     def deliver_webhook(self, message):
-        """Send a notification to the webhook with circuit breaker pattern."""
-        if not self.webhook_url:
-            logger.error("No webhook URL configured")
+        """Send a notification to the bucket-specific webhook with OAuth authentication."""
+        bucket_name = message.get("bucket")
+        
+        # Look up the bucket configuration
+        bucket_config = get_bucket_config(self.redis_client, bucket_name)
+        if not bucket_config:
+            # Fallback to in-memory config
+            bucket_config = next((b for b in self.config.get("buckets", []) if b["name"] == bucket_name), None)
+        
+        if not bucket_config or "webhook_url" not in bucket_config:
+            logger.error(f"No webhook URL configured for bucket {bucket_name}")
             return False
         
+        webhook_url = bucket_config["webhook_url"]
+        logger.debug(f"Preparing webhook request to {webhook_url} for bucket {bucket_name}")
+
+        
         # Check circuit breaker
-        if not self.circuit_breaker.allow_request():
-            logger.warning("Circuit breaker open, skipping webhook request")
+        if webhook_url not in self.circuit_breakers:
+            webhook_config = self.config.get("webhook", {})
+            self.circuit_breakers[webhook_url] = CircuitBreaker(
+                failure_threshold=webhook_config.get("circuit_threshold", 5),
+                reset_timeout=webhook_config.get("circuit_reset_time", 60)
+            )
+        
+        circuit_breaker = self.circuit_breakers[webhook_url]
+        
+        if not circuit_breaker.allow_request():
+            logger.warning(f"Circuit breaker open for {webhook_url}, skipping webhook request")
             self.stats["circuit_breaks"] += 1
             return False
         
@@ -162,46 +168,143 @@ class WebhookConsumer:
         message["delivery_attempt_time"] = datetime.now().isoformat()
         
         # Set up headers
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "X-Bucket-Name": bucket_name,
+            "X-Event-Type": message.get("event_type", "unknown")
+        }
         
-        # Add OAuth token if enabled
-        if self.oauth_enabled:
-            token = self.token_cache.get_token(
-                self.client_id, 
-                self.client_secret, 
-                self.token_url
-            )
+        # Check for webhook authentication
+        if "webhook_auth" in bucket_config and bucket_config["webhook_auth"].get("type") == "oauth2":
+            auth_config = bucket_config["webhook_auth"]
+            client_id = auth_config.get("client_id")
+            client_secret = auth_config.get("client_secret")
+            token_url = auth_config.get("token_url")
+
+            logger.debug(f"OAuth auth configured for bucket {bucket_name} with token URL: {token_url}")
             
-            if token:
-                headers["Authorization"] = f"bearer {token}"
-                logger.debug("Added OAuth bearer token to request")
-            else:
-                logger.error("Failed to get OAuth token, cannot proceed with webhook delivery")
-                self.stats["oauth_token_failures"] += 1
-                self.circuit_breaker.record_failure()
-                return False
+            if client_id and client_secret and token_url:
+
+                logger.debug(f"Requesting OAuth token from {token_url} for client ID {client_id}")
+
+                try:
+
+                    auth_str = f"{client_id}:{client_secret}"
+                    auth_bytes = auth_str.encode('ascii')
+                    base64_bytes = base64.b64encode(auth_bytes)
+                    base64_auth = base64_bytes.decode('ascii')
+                    
+                    headers_token_request = {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": f"Basic {base64_auth}"
+                    }
+                    
+                    data_token_request = {
+                        "grant_type": "client_credentials"
+                    }
+                    
+                    logger.debug(f"Making token request to {token_url}")
+                    
+                    token_response = requests.post(
+                        token_url, 
+                        headers=headers_token_request, 
+                        data=data_token_request,
+                        timeout=self.timeout
+                    )
+                    
+                    logger.info(f"Token response status: {token_response.status_code}")
+
+                    if token_response.status_code == 200:
+                        token_data = token_response.json()
+                        logger.debug(f"Token response data keys: {list(token_data.keys())}")
+                        
+                        access_token = token_data.get("access_token")
+                        #logger.info(f"Received access token: {access_token}")
+
+                        if access_token:
+                            token_length = len(access_token)
+                            token_stripped = access_token.strip()
+                            stripped_length = len(token_stripped)
+                            
+                            if token_length != stripped_length:
+                                logger.warning(f"Token contains whitespace! Original length: {token_length}, Stripped length: {stripped_length}")
+                                logger.warning(f"First 5 chars: '{access_token[:5]}', Last 5 chars: '{access_token[-5:]}'")
+                                # Use the stripped token instead
+                                access_token = token_stripped
+                        
+                        logger.info(f"Received access token: {access_token}")
+                        
+                        # Try uppercase "Bearer" as in curl
+                        headers["Authorization"] = f"Bearer {access_token}" 
+                        
+                        # Check for whitespace in the full Authorization header
+                        auth_header = headers["Authorization"]
+                        auth_header_stripped = auth_header.strip()
+                        if len(auth_header) != len(auth_header_stripped):
+                            logger.warning(f"Authorization header contains whitespace! Original: '{auth_header}', Stripped: '{auth_header_stripped}'")
+                            # Use the stripped header
+                            headers["Authorization"] = auth_header_stripped
+                        
+                        logger.debug(f"Added Authorization header: '{headers['Authorization']}'")
+                        # END OF NEW CODE
+                        
+                    else:
+                        logger.error(f"Token request failed: {token_response.status_code}, {token_response.text}")
+                except Exception as e:
+                    logger.error(f"Exception during token request: {type(e).__name__}: {str(e)}")
+                        
+
+        # Log the final headers and message
+        logger.debug(f"Final webhook request headers: {headers}")
+        logger.debug(f"Webhook request payload: {json.dumps(message)[:200]}... (truncated if longer)")
+                
+                # Get OAuth token
+                #access_token = get_oauth_token(client_id, client_secret, token_url)
+                
+                #if access_token:
+                    # Add token to headers
+                   # headers["Authorization"] = f"Bearer {access_token}"
+                   # logger.debug(f"Added OAuth bearer token to webhook request for {bucket_name}")
+                #else:
+                    #logger.error(f"Failed to get OAuth token for webhook delivery to {bucket_name}")
         
         try:
             # Send to webhook
+            logger.info(f"Sending webhook request to {webhook_url}")
             response = requests.post(
-                self.webhook_url,
+                webhook_url,
                 json=message,
                 headers=headers,
                 timeout=self.timeout
             )
+
+            logger.info(f"Webhook response status: {response.status_code}")
+            logger.debug(f"Webhook response headers: {dict(response.headers)}")
+            logger.info(f"Webhook response body: {response.text}")
             
             if response.status_code >= 200 and response.status_code < 300:
-                logger.info(f"Successfully delivered notification for {message['bucket']}/{message['key']}")
-                self.circuit_breaker.record_success()
+                logger.info(f"Successfully delivered notification for {message['bucket']}/{message['key']} to {webhook_url}")
+                circuit_breaker.record_success()
                 return True
             else:
-                logger.warning(f"Webhook returned error {response.status_code}: {response.text}")
-                self.circuit_breaker.record_failure()
+                logger.warning(f"Webhook {webhook_url} returned error {response.status_code}: {response.text}")
+                
+                # Clear token cache if authentication error
+                if (response.status_code == 401 or response.status_code == 403) and "webhook_auth" in bucket_config:
+                    auth_config = bucket_config["webhook_auth"]
+                    client_id = auth_config.get("client_id")
+                    token_url = auth_config.get("token_url")
+                    
+                    if client_id and token_url:
+                        clear_oauth_token_cache(client_id, token_url)
+                        logger.info(f"Cleared OAuth token for {client_id} due to authentication error")
+                
+                circuit_breaker.record_failure()
                 return False
                 
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Request to webhook failed: {e}")
-            self.circuit_breaker.record_failure()
+            logger.warning(f"Request to webhook {webhook_url} failed: {e}")
+            circuit_breaker.record_failure()
             return False
     
     def process_message(self, message):
@@ -284,25 +387,16 @@ class WebhookConsumer:
                     # Check if Redis is available, Sentinel is available, and webhook URL is configured
                     redis_ok = check_redis_health(self.redis_client)
                     sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
-                    webhook_ok = self.webhook_url is not None
                     
-                    # For OAuth, check if we can get a token
-                    oauth_ok = True
-                    if self.oauth_enabled:
-                        token = self.token_cache.get_token(
-                            self.client_id,
-                            self.client_secret,
-                            self.token_url
-                        )
-                        oauth_ok = token is not None
+                    # For webhook readiness, check if we have buckets with webhook URLs
+                    webhook_ok = any(bucket.get("webhook_url") for bucket in self.config.get("buckets", []))
                     
-                    status_code = 200 if (redis_ok and webhook_ok and sentinel_ok and oauth_ok) else 503
+                    status_code = 200 if (redis_ok and webhook_ok and sentinel_ok) else 503
                     ready_status = {
-                        "status": "ready" if (redis_ok and webhook_ok and sentinel_ok and oauth_ok) else "not_ready",
+                        "status": "ready" if (redis_ok and webhook_ok and sentinel_ok) else "not_ready",
                         "redis": "ok" if redis_ok else "error",
                         "sentinel": "ok" if sentinel_ok else "error",
-                        "webhook": "ok" if webhook_ok else "missing",
-                        "oauth": "ok" if oauth_ok else "error" if self.oauth_enabled else "disabled"
+                        "webhook": "ok" if webhook_ok else "missing"
                     }
                     self2.send_response(status_code)
                     self2.send_header('Content-Type', 'application/json')
@@ -315,19 +409,20 @@ class WebhookConsumer:
                     queue_stats = check_queue_stats(self.redis_client, self.config)
                     sentinel_stats = check_sentinel_health(self.config)
                     
+                    # Add circuit breaker stats per webhook
+                    circuit_stats = {}
+                    for webhook_url, circuit in self.circuit_breakers.items():
+                        circuit_stats[webhook_url] = {
+                            "state": circuit.state,
+                            "failures": circuit.failures
+                        }
+                    
                     metrics = {
                         "consumer_stats": self.stats,
                         "queue": queue_stats,
                         "sentinel": sentinel_stats,
                         "uptime_seconds": uptime,
-                        "circuit_breaker": {
-                            "state": self.circuit_breaker.state,
-                            "failures": self.circuit_breaker.failures
-                        },
-                        "oauth": {
-                            "enabled": self.oauth_enabled,
-                            "token_failures": self.stats.get("oauth_token_failures", 0)
-                        }
+                        "circuit_breakers": circuit_stats
                     }
                     
                     self2.send_response(200)
@@ -354,12 +449,7 @@ class WebhookConsumer:
     
     def run(self):
         """Run the consumer in a continuous loop."""
-        webhook_url_display = self.webhook_url if self.webhook_url else "not configured"
-        logger.info(f"Starting webhook consumer, delivering to: {webhook_url_display}")
-        
-        # Log OAuth status
-        if self.oauth_enabled:
-            logger.info(f"OAuth authentication enabled, token URL: {self.token_url}")
+        logger.info("Starting webhook consumer for bucket-specific webhook delivery")
         
         empty_polls = 0
         last_stats_time = time.time()
@@ -391,8 +481,6 @@ class WebhookConsumer:
                         f"retries {self.stats['retries']}, "
                         f"circuit breaks {self.stats['circuit_breaks']}"
                     )
-                    if self.oauth_enabled:
-                        logger.info(f"OAuth token failures: {self.stats.get('oauth_token_failures', 0)}")
                         
                     last_stats_time = time.time()
                     
