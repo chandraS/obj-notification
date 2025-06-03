@@ -18,6 +18,7 @@ import http.server
 import socketserver
 import requests
 import random
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -37,7 +38,29 @@ from utils import (
 )
 
 # Set up logging
-logger = setup_logging("webhook-consumer")
+base_logger = setup_logging("webhook-consumer")
+
+class ContextLogger:
+    def __init__(self, logger):
+        self.logger = logger
+    
+    def info(self, msg, **kwargs):
+        self.logger.info(msg, extra=kwargs)
+    
+    def debug(self, msg, **kwargs):
+        self.logger.debug(msg, extra=kwargs)
+    
+    def warning(self, msg, **kwargs):
+        self.logger.warning(msg, extra=kwargs)
+    
+    def error(self, msg, **kwargs):
+        self.logger.error(msg, extra=kwargs)
+    
+    def critical(self, msg, **kwargs):
+        self.logger.critical(msg, extra=kwargs)
+
+logger = ContextLogger(base_logger)
+
 
 class CircuitBreaker:
     """Circuit breaker pattern implementation for webhook endpoints."""
@@ -59,7 +82,7 @@ class CircuitBreaker:
             elif self.state == "open":
                 # Check if it's time to try again
                 if time.time() - self.last_failure_time > self.reset_timeout:
-                    logger.info("Circuit half-open, allowing test request")
+                    logger.debug("Circuit half-open, allowing test request")
                     self.state = "half-open"
                     return True
                 return False
@@ -131,9 +154,37 @@ class WebhookConsumer:
         else:
             logger.warning(f"Redis Sentinel not available: {sentinel_status.get('error')}")
     
+    def log_with_context(self, level, message, **extra):
+        """Log with the current request context."""
+        
+        # Call the appropriate logger method with context as extra
+        if level == "debug":
+            logger.debug(message, **extra)
+        elif level == "info":
+            logger.info(message, **extra)
+        elif level == "warning":
+            logger.warning(message, **extra)
+        elif level == "error":
+            logger.error(message, **extra)
+        elif level == "critical":
+            logger.critical(message, **extra)
+
     def deliver_webhook(self, message):
         """Send a notification to the bucket-specific webhook with OAuth authentication."""
-        bucket_name = message.get("bucket")
+        start_time = time.time()
+        bucket_name = message.get("bucket", "unknown")
+        object_key = message.get("key", "unknown")
+        event_type = message.get("event_type", "unknown")
+        request_id = message.get("request_id", "unknown")
+        retry_count = message.get("retry_count", 0)
+        
+        context = {
+            "request_id": request_id,
+            "bucket": bucket_name,
+            "object_key": object_key,
+            "event_type": event_type,
+            "retry_count": retry_count
+        }
         
         # Look up the bucket configuration
         bucket_config = get_bucket_config(self.redis_client, bucket_name)
@@ -142,12 +193,12 @@ class WebhookConsumer:
             bucket_config = next((b for b in self.config.get("buckets", []) if b["name"] == bucket_name), None)
         
         if not bucket_config or "webhook_url" not in bucket_config:
-            logger.error(f"No webhook URL configured for bucket {bucket_name}")
+            self.log_with_context("error", f"No webhook URL configured", **context)
             return False
         
         webhook_url = bucket_config["webhook_url"]
-        logger.debug(f"Preparing webhook request to {webhook_url} for bucket {bucket_name}")
-
+        self.log_with_context("debug", f"Preparing webhook request", 
+                            webhook_url=webhook_url, **context)
         
         # Check circuit breaker
         if webhook_url not in self.circuit_breakers:
@@ -160,7 +211,8 @@ class WebhookConsumer:
         circuit_breaker = self.circuit_breakers[webhook_url]
         
         if not circuit_breaker.allow_request():
-            logger.warning(f"Circuit breaker open for {webhook_url}, skipping webhook request")
+            self.log_with_context("warning", f"Circuit breaker open, skipping webhook request", 
+                                webhook_url=webhook_url, **context)
             self.stats["circuit_breaks"] += 1
             return False
         
@@ -171,7 +223,8 @@ class WebhookConsumer:
         headers = {
             "Content-Type": "application/json",
             "X-Bucket-Name": bucket_name,
-            "X-Event-Type": message.get("event_type", "unknown")
+            "X-Event-Type": message.get("event_type", "unknown"),
+            "X-Request-ID": request_id
         }
         
         # Check for webhook authentication
@@ -181,14 +234,13 @@ class WebhookConsumer:
             client_secret = auth_config.get("client_secret")
             token_url = auth_config.get("token_url")
 
-            logger.debug(f"OAuth auth configured for bucket {bucket_name} with token URL: {token_url}")
+            self.log_with_context("debug", f"OAuth auth configured", 
+                                webhook_url=webhook_url, token_url=token_url, **context)
             
             if client_id and client_secret and token_url:
-
-                logger.debug(f"Requesting OAuth token from {token_url} for client ID {client_id}")
+                self.log_with_context("debug", f"Requesting OAuth token from {token_url} for client ID {client_id}", **context)
 
                 try:
-
                     auth_str = f"{client_id}:{client_secret}"
                     auth_bytes = auth_str.encode('ascii')
                     base64_bytes = base64.b64encode(auth_bytes)
@@ -203,7 +255,7 @@ class WebhookConsumer:
                         "grant_type": "client_credentials"
                     }
                     
-                    logger.debug(f"Making token request to {token_url}")
+                    self.log_with_context("debug", f"Making token request to {token_url}", **context)
                     
                     token_response = requests.post(
                         token_url, 
@@ -212,14 +264,15 @@ class WebhookConsumer:
                         timeout=self.timeout
                     )
                     
-                    logger.info(f"Token response status: {token_response.status_code}")
+                    self.log_with_context("info", f"Token response status", 
+                                        status_code=token_response.status_code, **context)
 
                     if token_response.status_code == 200:
                         token_data = token_response.json()
-                        logger.debug(f"Token response data keys: {list(token_data.keys())}")
+                        self.log_with_context("debug", f"Token response data keys", 
+                                            keys=list(token_data.keys()), **context)
                         
                         access_token = token_data.get("access_token")
-                        #logger.info(f"Received access token: {access_token}")
 
                         if access_token:
                             token_length = len(access_token)
@@ -227,12 +280,15 @@ class WebhookConsumer:
                             stripped_length = len(token_stripped)
                             
                             if token_length != stripped_length:
-                                logger.warning(f"Token contains whitespace! Original length: {token_length}, Stripped length: {stripped_length}")
-                                logger.warning(f"First 5 chars: '{access_token[:5]}', Last 5 chars: '{access_token[-5:]}'")
+                                self.log_with_context("warning", f"Token contains whitespace!", 
+                                                original_length=token_length, 
+                                                stripped_length=stripped_length,
+                                                first_chars=access_token[:5], 
+                                                last_chars=access_token[-5:], **context)
                                 # Use the stripped token instead
                                 access_token = token_stripped
                         
-                        logger.info(f"Received access token: {access_token}")
+                        self.log_with_context("info", f"Received access token", token_prefix=access_token[:5], **context)
                         
                         # Try uppercase "Bearer" as in curl
                         headers["Authorization"] = f"Bearer {access_token}" 
@@ -241,53 +297,56 @@ class WebhookConsumer:
                         auth_header = headers["Authorization"]
                         auth_header_stripped = auth_header.strip()
                         if len(auth_header) != len(auth_header_stripped):
-                            logger.warning(f"Authorization header contains whitespace! Original: '{auth_header}', Stripped: '{auth_header_stripped}'")
+                            self.log_with_context("warning", f"Authorization header contains whitespace!", 
+                                            original=auth_header, 
+                                            stripped=auth_header_stripped, **context)
                             # Use the stripped header
                             headers["Authorization"] = auth_header_stripped
                         
-                        logger.debug(f"Added Authorization header: '{headers['Authorization']}'")
-                        # END OF NEW CODE
+                        self.log_with_context("debug", f"Added Authorization header", 
+                                            auth_header=headers["Authorization"], **context)
                         
                     else:
-                        logger.error(f"Token request failed: {token_response.status_code}, {token_response.text}")
+                        self.log_with_context("error", f"Token request failed", 
+                                            status_code=token_response.status_code, 
+                                            response=token_response.text, **context)
                 except Exception as e:
-                    logger.error(f"Exception during token request: {type(e).__name__}: {str(e)}")
-                        
+                    self.log_with_context("error", f"Exception during token request", 
+                                        error_type=type(e).__name__,
+                                        error=str(e), **context)
 
         # Log the final headers and message
-        logger.debug(f"Final webhook request headers: {headers}")
-        logger.debug(f"Webhook request payload: {json.dumps(message)[:200]}... (truncated if longer)")
-                
-                # Get OAuth token
-                #access_token = get_oauth_token(client_id, client_secret, token_url)
-                
-                #if access_token:
-                    # Add token to headers
-                   # headers["Authorization"] = f"Bearer {access_token}"
-                   # logger.debug(f"Added OAuth bearer token to webhook request for {bucket_name}")
-                #else:
-                    #logger.error(f"Failed to get OAuth token for webhook delivery to {bucket_name}")
+        self.log_with_context("debug", f"Final webhook request headers", 
+                            headers=headers, **context)
+        self.log_with_context("debug", f"Webhook request payload", 
+                            payload=json.dumps(message)[:200], **context)
         
         try:
             # Send to webhook
-            logger.info(f"Sending webhook request to {webhook_url}")
+            self.log_with_context("info", f"Sending webhook request", 
+                                webhook_url=webhook_url, **context)
+            
             response = requests.post(
                 webhook_url,
                 json=message,
                 headers=headers,
                 timeout=self.timeout
             )
-
-            logger.info(f"Webhook response status: {response.status_code}")
-            logger.debug(f"Webhook response headers: {dict(response.headers)}")
-            logger.info(f"Webhook response body: {response.text}")
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            self.log_with_context("info", f"Webhook response received", 
+                                response_code=response.status_code,
+                                duration_ms=duration_ms, 
+                                response_body=response.text[:200], **context)
             
             if response.status_code >= 200 and response.status_code < 300:
-                logger.info(f"Successfully delivered notification for {message['bucket']}/{message['key']} to {webhook_url}")
+                self.log_with_context("info", f"Successfully delivered notification", **context)
                 circuit_breaker.record_success()
                 return True
             else:
-                logger.warning(f"Webhook {webhook_url} returned error {response.status_code}: {response.text}")
+                self.log_with_context("warning", f"Webhook returned error", 
+                                    response_code=response.status_code,
+                                    response_body=response.text[:200], **context)
                 
                 # Clear token cache if authentication error
                 if (response.status_code == 401 or response.status_code == 403) and "webhook_auth" in bucket_config:
@@ -297,20 +356,42 @@ class WebhookConsumer:
                     
                     if client_id and token_url:
                         clear_oauth_token_cache(client_id, token_url)
-                        logger.info(f"Cleared OAuth token for {client_id} due to authentication error")
+                        self.log_with_context("info", f"Cleared OAuth token due to authentication error", 
+                                            client_id=client_id, **context)
                 
                 circuit_breaker.record_failure()
                 return False
                 
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Request to webhook {webhook_url} failed: {e}")
+            self.log_with_context("warning", f"Request to webhook failed", 
+                                error=str(e), webhook_url=webhook_url, **context)
             circuit_breaker.record_failure()
             return False
     
     def process_message(self, message):
         """Process a message and send to webhook with retries."""
+
+        if "request_id" not in message:
+            message["request_id"] = str(uuid.uuid4())
+        
+        request_id = message["request_id"]
         retry_count = message.get("retry_count", 0)
         message["retry_count"] = retry_count + 1
+
+        bucket = message.get("bucket", "unknown")
+        object_key = message.get("key", "unknown")
+        event_type = message.get("event_type", "unknown")
+
+        context = {
+            "request_id": request_id,
+            "bucket": bucket,
+            "object_key": object_key,
+            "event_type": event_type, 
+            "retry_count": retry_count
+        }
+
+
+        self.log_with_context("info", f"Processing webhook delivery", **context)
         
         # Attempt delivery
         success = self.deliver_webhook(message)
@@ -328,8 +409,8 @@ class WebhookConsumer:
                 # Calculate backoff time
                 backoff = (self.backoff_factor ** retry_count) + random.random()
                 
-                logger.info(f"Will retry message for {message['bucket']}/{message['key']} "
-                           f"after {backoff:.2f}s (attempt {retry_count+1}/{self.max_retries})")
+                self.log_with_context("info", f"Will retry message after {backoff:.2f}s", 
+                                   backoff_seconds=backoff, **context)
                   
                 # Sleep for backoff period
                 time.sleep(backoff)
@@ -339,7 +420,7 @@ class WebhookConsumer:
                 return self.process_message(message)
             else:
                 # Max retries exceeded
-                logger.error(f"Max retries exceeded for {message['bucket']}/{message['key']}")
+                self.log_with_context("error", f"Max retries exceeded", **context)
                 return False
     
     def process_batch(self):
@@ -348,6 +429,10 @@ class WebhookConsumer:
         
         if not messages:
             return 0
+        
+        batch_id = str(uuid.uuid4())
+        self.log_with_context("info", f"Processing batch of {len(messages)} messages", 
+                             batch_size=len(messages), batch_id=batch_id)
         
         # Use thread pool to process messages in parallel
         with ThreadPoolExecutor(max_workers=self.webhook_threads) as executor:
@@ -359,12 +444,14 @@ class WebhookConsumer:
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error(f"Error processing message: {e}")
+                    self.log_with_context("error", f"Error processing message: {e}", 
+                                         error=str(e), error_type=type(e).__name__)
         
         # Update statistics
         self.stats["messages_processed"] += len(messages)
         
-        logger.info(f"Processed batch of {len(messages)} messages")
+        self.log_with_context("info", f"Completed batch processing", 
+                             batch_size=len(messages), batch_id=batch_id)
         return len(messages)
     
     def start_health_server(self):
@@ -474,12 +561,13 @@ class WebhookConsumer:
                 
                 # Log stats periodically (every minute)
                 if time.time() - last_stats_time > 60:
-                    logger.info(
+                    self.log_with_context("info", 
                         f"Statistics: processed {self.stats['messages_processed']}, "
                         f"success {self.stats['successful_deliveries']}, "
                         f"failed {self.stats['failed_deliveries']}, "
                         f"retries {self.stats['retries']}, "
-                        f"circuit breaks {self.stats['circuit_breaks']}"
+                        f"circuit breaks {self.stats['circuit_breaks']}",
+                        stats=self.stats
                     )
                         
                     last_stats_time = time.time()
@@ -487,16 +575,17 @@ class WebhookConsumer:
                     # Also check sentinel status periodically
                     sentinel_status = check_sentinel_health(self.config)
                     if sentinel_status["status"] == "ok":
-                        logger.debug(f"Redis Sentinel active: {sentinel_status.get('slave_count')} slaves")
+                        self.log_with_context("debug", f"Redis Sentinel active", slave_count=sentinel_status.get('slave_count'))
                     else:
-                        logger.warning(f"Redis Sentinel issue detected: {sentinel_status.get('error')}")
+                        self.log_with_context("warning", f"Redis Sentinel issue detected", error=sentinel_status.get('error'))
                     
             except KeyboardInterrupt:
                 logger.info("Consumer stopped by user")
                 self.running = False
                 break
             except Exception as e:
-                logger.error(f"Error in consumer main loop: {e}")
+                self.log_with_context("error", f"Error in consumer main loop: {e}", 
+                                     error=str(e), error_type=type(e).__name__)
                 # Don't crash, sleep and retry
                 time.sleep(5)
         
