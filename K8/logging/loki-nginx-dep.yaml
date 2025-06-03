@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki-proxy
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki-proxy
+  template:
+    metadata:
+      labels:
+        app: loki-proxy
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 443
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: loki.conf
+        - name: ssl-certs
+          mountPath: /etc/nginx/certs
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: loki-nginx-conf
+      - name: ssl-certs
+        secret:
+          secretName: loki-tls 
