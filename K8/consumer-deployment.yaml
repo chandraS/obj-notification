@@ -14,10 +14,14 @@ spec:
     metadata:
       labels:
         app: webhook-consumer
+      annotations:
+        # Add annotation for Promtail to discover
+        promtail.io/scrape: "true"
+        promtail.io/app: "webhook-consumer"
     spec:
       containers:
       - name: webhook-consumer
-        image: ${YOUR_REGISTRY}/bucket-consumer:latest  # Replace with your image
+        image: shicha/bucket-consumer:update-config-auth-webhook-auth-logging  # Updated image tag
         imagePullPolicy: Always
         resources:
           requests:
@@ -31,14 +35,17 @@ spec:
           value: "redis"
         - name: LOG_LEVEL
           value: "INFO"
-        - name: WEBHOOK_URL
-          valueFrom:
-            secretKeyRef:
-              name: bucket-secrets
-              key: webhook-url
+        - name: LOG_FORMAT_JSON
+          value: "true"  # Enable JSON formatting
+        - name: LOG_FILE
+          value: "/app/logs/consumer.log"  # Add log file path
         volumeMounts:
         - name: config-volume
           mountPath: /app/config
+        - name: secrets-volume
+          mountPath: /app/secrets
+        - name: logs-volume  # Add log volume mount
+          mountPath: /app/logs
         livenessProbe:
           httpGet:
             path: /health
@@ -51,10 +58,38 @@ spec:
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
+          
+      # Add log collection sidecar
+      - name: log-collector
+        image: grafana/promtail:2.8.2
+        args:
+        - -config.file=/etc/promtail/config.yaml
+        - -log.level=info
+        volumeMounts:
+        - name: logs-volume
+          mountPath: /logs
+        - name: promtail-config
+          mountPath: /etc/promtail
+        resources:
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+            
       volumes:
       - name: config-volume
         configMap:
           name: monitor-config
+      - name: secrets-volume
+        secret:
+          secretName: bucket-secrets
+      - name: logs-volume  # Add logs volume
+        emptyDir: {}
+      - name: promtail-config
+        configMap:
+          name: consumer-promtail-config
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
