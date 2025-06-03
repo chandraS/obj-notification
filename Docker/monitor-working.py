@@ -986,6 +986,8 @@ class MultiRegionMonitor:
                         except:
                             logger.critical("Failed to send error response", exc_info=True)
 
+                    return
+
                 
                 if parsed_url.path == '/api/bucket-notifications/disable':
 
