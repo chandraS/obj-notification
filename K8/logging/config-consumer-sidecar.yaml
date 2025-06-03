@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: consumer-promtail-config
+  namespace: object-monitor
+data:
+  config.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    
+    positions:
+      filename: /tmp/positions.yaml
+    
+    clients:
+      - url: http://loki.monitoring.svc:3100/loki/api/v1/push
+    
+    scrape_configs:
+      - job_name: consumer-logs
+        static_configs:
+        - targets:
+            - localhost
+          labels:
+            app: webhook-consumer
+            __path__: /logs/*.log
+        pipeline_stages:
+          - json:
+              expressions:
+                timestamp: timestamp
+                level: level
+                logger: logger
+                message: message
+                bucket: bucket
+                object_key: object_key
+                event_type: event_type
+                webhook_url: webhook_url
+                response_code: response_code
+                duration_ms: duration_ms
+                retry_count: retry_count
+                request_id: request_id
+          - labels:
+              level:
+              logger:
+              bucket:
+              event_type:
+              request_id:
