@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: bucket-monitor
-        image: ${YOUR_REGISTRY}/bucket-monitor:latest  # Replace with your image
+        image: shicha/bucket-monitor:update-config-auth-webhook-auth-v1  # Replace with your image
         imagePullPolicy: Always
         resources:
           requests:
@@ -33,6 +33,21 @@ spec:
               name: monitor-config
               key: polling_interval
               optional: true
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-auth-secrets
+              key: jwt-secret
+        - name: API_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: api-auth-secrets
+              key: client-id
+        - name: API_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-auth-secrets
+              key: client-secret
         - name: REDIS_HOST
           value: "redis"
         - name: LOG_LEVEL
