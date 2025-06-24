@@ -41,6 +41,9 @@ from utils import (
     disable_bucket_notifications,
     get_pending_bucket_configs,
     save_bucket_config,
+    get_bucket_credentials_from_infisical,
+    add_credentials_to_infisical,
+    delete_credentials_from_infisical,
     add_bucket_info_to_redis,
     get_bucket_webhook_url,
     generate_jwt_token,
@@ -329,16 +332,14 @@ class MultiRegionMonitor:
         }
 
     def refresh_config_from_redis(self):
-        """Refresh in-memory configuration from Redis."""
-        logger.info("Refreshing configuration from Redis")
+        """Refresh configuration from Redis but get credentials from Infisical"""
+        logger.info("Refreshing configuration from Redis and Infisical")
         
         client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
         all_bucket_keys = client.keys("linode:objstore:config:bucket:*")
         
-        # Create a new buckets array
         new_buckets = []
         
-        # Populate from Redis
         for key in all_bucket_keys:
             bucket_data = client.get(key)
             if bucket_data:
@@ -346,13 +347,24 @@ class MultiRegionMonitor:
                     if isinstance(bucket_data, bytes):
                         bucket_data = bucket_data.decode('utf-8')
                     bucket_config = json.loads(bucket_data)
+                    
+                    # Get credentials from Infisical
+                    bucket_name = bucket_config['name']
+                    infisical_creds = get_bucket_credentials_from_infisical(bucket_name)
+                    
+                    if infisical_creds:
+                        bucket_config['access_key'] = infisical_creds['access_key']
+                        bucket_config['secret_key'] = infisical_creds['secret_key']
+                        logger.debug(f"Loaded credentials from Infisical for {bucket_name}")
+                    else:
+                        logger.warning(f"No Infisical credentials for {bucket_name}, using stored values")
+                    
                     new_buckets.append(bucket_config)
                 except json.JSONDecodeError:
                     logger.error(f"Error decoding JSON from Redis for key {key}")
         
-        # Update the in-memory config
         self.config["buckets"] = new_buckets
-        logger.info(f"Refreshed configuration from Redis: {len(new_buckets)} buckets loaded")
+        logger.info(f"Refreshed configuration: {len(new_buckets)} buckets loaded")
     
     def handle_signal(self, signum, frame):
         """Handle termination signals."""
@@ -1116,19 +1128,38 @@ class MultiRegionMonitor:
                                 "error": f"Bucket {data['name']} already exists"
                             }).encode())
                             return
+                        
+                        # Extract S3 credentials for Infisical
+                        bucket_name = data["name"]
+                        access_key = data["access_key"]
+                        secret_key = data["secret_key"]
+                        
+                        # Step 1: Add S3 credentials to Infisical
+                        try:
+                            if not add_credentials_to_infisical(bucket_name, access_key, secret_key):
+                                raise Exception("Failed to store credentials in Infisical")
+                            logger.info(f"Successfully stored credentials in Infisical for bucket {bucket_name}")
+                        except Exception as e:
+                            logger.error(f"Failed to store credentials in Infisical: {e}")
+                            self2.send_response(500)
+                            self2.send_header('Content-Type', 'application/json')
+                            self2.end_headers()
+                            self2.wfile.write(json.dumps({
+                                "error": f"Failed to store credentials securely: {str(e)}"
+                            }).encode())
+                            return
                             
-                        # Create the bucket configuration
+                        # Step 2: Create bucket configuration WITHOUT S3 credentials
                         bucket_config = {
                             "name": data["name"],
-                            "access_key": data["access_key"],
-                            "secret_key": data["secret_key"],
+                            # NO access_key or secret_key stored here
                             "endpoint": data.get("region", data.get("endpoint")),
                             "webhook_url": data["webhook_url"],
                             "status": "active",
                             "added_at": datetime.now().isoformat()
                         }
                         
-                        # Add authentication if provided
+                        # Add authentication if provided (OAuth stays in Redis)
                         if "client_id" in data and "client_secret" in data and "token_url" in data:
                             bucket_config["webhook_auth"] = {
                                 "type": "oauth2",
@@ -1137,23 +1168,30 @@ class MultiRegionMonitor:
                                 "token_url": data.get("token_url")
                             }
                         
-                        # Add to active configuration
+                        # Step 3: Add to active configuration
                         success = self.add_bucket_to_active_config(bucket_config)
 
                         if success:
                             # Refresh from Redis to ensure consistency
                             self.refresh_config_from_redis()
-                        
-                        if success:
+                            
                             self2.send_response(201)  # Created
                             self2.send_header('Content-Type', 'application/json')
                             self2.end_headers()
                             self2.wfile.write(json.dumps({
                                 "status": "success",
                                 "message": f"Bucket {data['name']} added to active configuration",
-                                "bucket": data['name']
+                                "bucket": data['name'],
+                                "note": "S3 credentials stored securely in vault"
                             }).encode())
                         else:
+                            # Rollback: Try to remove credentials from Infisical if Redis save failed
+                            try:
+                                delete_credentials_from_infisical(bucket_name)
+                                logger.warning(f"Rolled back Infisical credentials for {bucket_name} after Redis failure")
+                            except Exception as rollback_error:
+                                logger.error(f"Failed to rollback Infisical credentials: {rollback_error}")
+                            
                             self2.send_response(500)
                             self2.send_header('Content-Type', 'application/json')
                             self2.end_headers()
@@ -1199,15 +1237,41 @@ class MultiRegionMonitor:
                         bucket_name = data['name']
                         bucket_exists = False
                         
+                        # Check if S3 credentials are being updated
+                        updating_s3_creds = "access_key" in data or "secret_key" in data
+                        
+                        if updating_s3_creds:
+                            # If updating S3 credentials, both must be provided
+                            if not ("access_key" in data and "secret_key" in data):
+                                self2.send_response(400)
+                                self2.send_header('Content-Type', 'application/json')
+                                self2.end_headers()
+                                self2.wfile.write(json.dumps({
+                                    "error": "Both access_key and secret_key must be provided when updating credentials"
+                                }).encode())
+                                return
+                            
+                            # Update credentials in Infisical
+                            try:
+                                if not add_credentials_to_infisical(bucket_name, data["access_key"], data["secret_key"]):
+                                    raise Exception("Failed to update credentials in Infisical")
+                                logger.info(f"Successfully updated credentials in Infisical for bucket {bucket_name}")
+                            except Exception as e:
+                                logger.error(f"Failed to update credentials in Infisical: {e}")
+                                self2.send_response(500)
+                                self2.send_header('Content-Type', 'application/json')
+                                self2.end_headers()
+                                self2.wfile.write(json.dumps({
+                                    "error": f"Failed to update credentials securely: {str(e)}"
+                                }).encode())
+                                return
+                        
                         for i, bucket in enumerate(self.config.get("buckets", [])):
                             if bucket["name"] == bucket_name:
                                 bucket_exists = True
                                 
-                                # Update standard fields if present
-                                if "access_key" in data:
-                                    self.config["buckets"][i]["access_key"] = data["access_key"]
-                                if "secret_key" in data:
-                                    self.config["buckets"][i]["secret_key"] = data["secret_key"]
+                                # Update non-sensitive fields only
+                                # DO NOT update access_key or secret_key in Redis
                                 if "region" in data:
                                     self.config["buckets"][i]["endpoint"] = data["region"]
                                 elif "endpoint" in data:
@@ -1230,7 +1294,7 @@ class MultiRegionMonitor:
                                 # Mark update time
                                 self.config["buckets"][i]["updated_at"] = datetime.now().isoformat()
                                 
-                                # Save to Redis
+                                # Save to Redis (without S3 credentials)
                                 save_bucket_config(self.redis_client, self.config["buckets"][i])
 
                                 self.refresh_config_from_redis()
@@ -1253,10 +1317,13 @@ class MultiRegionMonitor:
                         self2.send_response(200)
                         self2.send_header('Content-Type', 'application/json')
                         self2.end_headers()
-                        self2.wfile.write(json.dumps({
+                        response_message = {
                             "status": "success",
                             "message": f"Bucket {bucket_name} updated"
-                        }).encode())
+                        }
+                        if updating_s3_creds:
+                            response_message["note"] = "S3 credentials updated in vault"
+                        self2.wfile.write(json.dumps(response_message).encode())
                     
                     except json.JSONDecodeError:
                         self2.send_response(400)
@@ -1266,8 +1333,8 @@ class MultiRegionMonitor:
                             "error": "Invalid JSON payload"
                         }).encode()) 
 
-                elif parsed_url.path == '/api/buckets/delete':
 
+                elif parsed_url.path == '/api/buckets/delete':
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -1292,31 +1359,32 @@ class MultiRegionMonitor:
                         self2.wfile.write(json.dumps({"error": "Bucket not found"}).encode())
                         return
                     
-                    # Delete bucket from configuration
-                    self.config["buckets"] = [b for b in self.config.get("buckets", []) if b["name"] != bucket_name]
+                    # Step 1: Delete from Infisical
+                    try:
+                        delete_credentials_from_infisical(bucket_name)
+                        logger.info(f"Deleted credentials from Infisical for bucket {bucket_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete credentials from Infisical: {e}")
+                        # Continue with deletion even if Infisical fails
                     
-                    # Delete from Redis
-                    client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
-                    #redis_key = f"linode:objstore:bucket_config:{bucket_name}"
-                    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
-                    client.delete(redis_key)
+                    # Step 2: Delete from Redis and in-memory config
+                    success = self.delete_bucket_config(bucket_name)
                     
-                    # Clean up any state associated with this bucket
-                    #client.delete(f"linode:objstore:last_scan:{bucket_name}")
-                    #client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
-
-                    client.delete(f"linode:objstore:last_scan:{bucket_name}")
-                    client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
-
-                    self.refresh_config_from_redis()
-                    
-                    self2.send_response(200)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps({
-                        "status": "success",
-                        "message": f"Bucket {bucket_name} deleted"
-                    }).encode())        
+                    if success:
+                        self2.send_response(200)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({
+                            "status": "success",
+                            "message": f"Bucket {bucket_name} deleted completely"
+                        }).encode())
+                    else:
+                        self2.send_response(500)
+                        self2.send_header('Content-Type', 'application/json')
+                        self2.end_headers()
+                        self2.wfile.write(json.dumps({
+                            "error": "Failed to delete bucket configuration"
+                        }).encode())       
 
                 else:
                     self2.send_response(404)
