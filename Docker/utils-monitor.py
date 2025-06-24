@@ -12,10 +12,19 @@ import os
 import time
 import yaml
 import jwt
+from typing import Dict, Optional
 import redis
 from datetime import datetime, timedelta
 from redis.sentinel import Sentinel
 from datetime import datetime, timedelta
+
+INFISICAL_API_URL = os.getenv("INFISICAL_API_URL", "https://hmsinfvault.akamai-mco.com").rstrip("/")
+INFISICAL_TOKEN = os.getenv("INFISICAL_TOKEN")
+INFISICAL_PROJECT_ID = os.getenv("INFISICAL_PROJECT_ID")
+INFISICAL_ENV = os.getenv("INFISICAL_ENV", "dev")
+
+_infisical_cache = {}
+_cache_ttl = 300  # 5 minutes
 
 # Configure logging
 def setup_logging(name, level=None):
@@ -598,3 +607,168 @@ def save_object_state(redis_client, config, bucket, key, state):
     except Exception as e:
         logger.error(f"Error saving state to Redis for {redis_key}: {e}")
         return False
+
+def get_bucket_credentials_from_infisical(bucket_name: str) -> Optional[Dict[str, str]]:
+    """Retrieve bucket credentials from Infisical"""
+    global _infisical_cache
+    
+    # Check cache first
+    cache_key = f"{bucket_name}:{INFISICAL_ENV}"
+    if cache_key in _infisical_cache:
+        cached_data, cache_time = _infisical_cache[cache_key]
+        if time.time() - cache_time < _cache_ttl:
+            return cached_data
+    
+    if not INFISICAL_TOKEN or not INFISICAL_PROJECT_ID:
+        logger.error("Infisical credentials not configured")
+        return None
+    
+    try:
+        # Get both access and secret keys
+        headers = {
+            "Authorization": f"Bearer {INFISICAL_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        credentials = {}
+        
+        # Retrieve access key
+        access_key_name = f"{bucket_name.upper().replace('-', '_')}_ACCESS_KEY"
+        url = f"{INFISICAL_API_URL}/api/v3/secrets/raw/{access_key_name}"
+        params = {
+            "workspaceId": INFISICAL_PROJECT_ID,
+            "environment": INFISICAL_ENV,
+            "secretPath": "/"
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            credentials['access_key'] = data.get('secret', {}).get('secretValue')
+        
+        # Retrieve secret key
+        secret_key_name = f"{bucket_name.upper().replace('-', '_')}_SECRET_KEY"
+        url = f"{INFISICAL_API_URL}/api/v3/secrets/raw/{secret_key_name}"
+        
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            credentials['secret_key'] = data.get('secret', {}).get('secretValue')
+        
+        if credentials.get('access_key') and credentials.get('secret_key'):
+            # Cache the credentials
+            _infisical_cache[cache_key] = (credentials, time.time())
+            return credentials
+        else:
+            logger.error(f"Failed to retrieve complete credentials for bucket {bucket_name}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error retrieving credentials from Infisical: {e}")
+        return None
+
+def get_bucket_config(redis_client, bucket_name):
+    """Get bucket configuration from Redis, but fetch credentials from Infisical"""
+    # Get base config from Redis
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+    config_json = client.get(redis_key)
+    
+    if config_json:
+        try:
+            bucket_config = json.loads(config_json)
+            
+            # Override credentials with Infisical values
+            infisical_creds = get_bucket_credentials_from_infisical(bucket_name)
+            if infisical_creds:
+                bucket_config['access_key'] = infisical_creds['access_key']
+                bucket_config['secret_key'] = infisical_creds['secret_key']
+                logger.debug(f"Using credentials from Infisical for bucket {bucket_name}")
+            else:
+                logger.warning(f"Failed to get Infisical credentials for {bucket_name}, using Redis fallback")
+            
+            return bucket_config
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON in Redis for {redis_key}")
+    
+    return None
+
+def add_credentials_to_infisical(bucket_name: str, access_key: str, secret_key: str) -> bool:
+    """Add S3 credentials to Infisical"""
+    url_base = f"{INFISICAL_API_URL}/api/v3/secrets/raw"
+    
+    headers = {
+        "Authorization": f"Bearer {INFISICAL_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # Create both secrets
+    secrets_to_create = [
+        {
+            "name": f"{bucket_name.upper().replace('-', '_')}_ACCESS_KEY",
+            "value": access_key
+        },
+        {
+            "name": f"{bucket_name.upper().replace('-', '_')}_SECRET_KEY",
+            "value": secret_key
+        }
+    ]
+    
+    for secret in secrets_to_create:
+        url = f"{url_base}/{secret['name']}"
+        payload = {
+            "workspaceId": INFISICAL_PROJECT_ID,
+            "environment": INFISICAL_ENV,
+            "secretPath": "/",
+            "secretValue": secret['value'],
+            "type": "shared",
+            "skipMultilineEncoding": True
+        }
+        
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code not in [200, 201]:
+            logger.error(f"Failed to create secret {secret['name']}: {response.text}")
+            return False
+    
+    return True
+
+def delete_credentials_from_infisical(bucket_name: str) -> bool:
+    """Delete S3 credentials from Infisical"""
+    headers = {
+        "Authorization": f"Bearer {INFISICAL_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # Delete both secrets
+    secret_names = [
+        f"{bucket_name.upper().replace('-', '_')}_ACCESS_KEY",
+        f"{bucket_name.upper().replace('-', '_')}_SECRET_KEY"
+    ]
+
+    all_deleted = True
+    
+    for secret_name in secret_names:
+        url = f"{INFISICAL_API_URL}/api/v3/secrets/raw/{secret_name}"
+        params = {
+            "workspaceId": INFISICAL_PROJECT_ID,
+            "environment": INFISICAL_ENV,
+            "secretPath": "/"
+        }
+        
+        try:
+            response = requests.delete(url, headers=headers, params=params)
+        
+            if response.status_code not in [200, 204]:
+                logger.info(f"Successfully deleted secret {secret_name}")
+            elif response.status_code == 404:
+                logger.info(f"Secret {secret_name} already deleted or doesn't exist")
+            else:
+                logger.error(f"Failed to delete secret {secret_name}: Status {response.status_code}, Response: {response.text}")
+                all_deleted = False
+
+        except Exception as e:
+            logger.error(f"Exception deleting secret {secret_name}: {e}")
+            all_deleted = False
+    
+    return all_deleted
