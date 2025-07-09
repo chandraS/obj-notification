@@ -759,7 +759,7 @@ def delete_credentials_from_infisical(bucket_name: str) -> bool:
         try:
             response = requests.delete(url, headers=headers, params=params)
         
-            if response.status_code not in [200, 204]:
+            if response.status_code in [200, 204]:
                 logger.info(f"Successfully deleted secret {secret_name}")
             elif response.status_code == 404:
                 logger.info(f"Secret {secret_name} already deleted or doesn't exist")
