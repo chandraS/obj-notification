@@ -207,7 +207,7 @@ class BucketScanner(threading.Thread):
                         continue
                     
                     # Process change
-                    # Get object details 
+                    # Get object details (only if needed)
                     details = {}
                     try:
                         details = s3_client.head_object(
@@ -302,7 +302,7 @@ class MultiRegionMonitor:
         self.last_scan_times = {}
         self.load_last_scan_times()
         
-        # Initialize bucket offsets for scanning
+        # Initialize bucket offsets for staggered scanning
         self.bucket_offsets = {}
         self.initialize_staggered_schedule()
         
@@ -374,7 +374,7 @@ class MultiRegionMonitor:
     def load_last_scan_times(self):
         """Load last scan times for all buckets from Redis."""
         try:
-            # Use redis slave client for reads when available
+            # Use slave client for reads when available
             client = self.redis_client.get("slave", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
             
             for bucket_config in self.config.get("buckets", []):
