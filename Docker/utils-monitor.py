@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Utility functions for the Linode Object Storage Monitoring System.
 With Redis Sentinel support for high availability.
@@ -735,6 +734,13 @@ def add_credentials_to_infisical(bucket_name: str, access_key: str, secret_key: 
 
 def delete_credentials_from_infisical(bucket_name: str) -> bool:
     """Delete S3 credentials from Infisical"""
+
+    cache_key = f"{bucket_name}:{INFISICAL_ENV}"
+    
+    if cache_key in _infisical_cache:
+        logger.info(f"Clearing cached credentials for {bucket_name}")
+        del _infisical_cache[cache_key]
+
     headers = {
         "Authorization": f"Bearer {INFISICAL_TOKEN}",
         "Content-Type": "application/json"
@@ -750,14 +756,14 @@ def delete_credentials_from_infisical(bucket_name: str) -> bool:
     
     for secret_name in secret_names:
         url = f"{INFISICAL_API_URL}/api/v3/secrets/raw/{secret_name}"
-        params = {
+        payload = {
             "workspaceId": INFISICAL_PROJECT_ID,
             "environment": INFISICAL_ENV,
             "secretPath": "/"
         }
         
         try:
-            response = requests.delete(url, headers=headers, params=params)
+            response = requests.delete(url, headers=headers, json=payload)
         
             if response.status_code in [200, 204]:
                 logger.info(f"Successfully deleted secret {secret_name}")
