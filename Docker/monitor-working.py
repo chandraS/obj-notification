@@ -152,9 +152,12 @@ class BucketScanner(threading.Thread):
                 "new_objects": 0,
                 "updated_objects": 0,
                 "detected_objects": 0,
+                "deleted_objects": 0,
                 "errors": 0,
                 "scan_duration": 0
             }
+
+            all_current_objects = []
             
             # Use paginator to handle buckets with many objects
             paginator = s3_client.get_paginator('list_objects_v2')
@@ -777,7 +780,57 @@ class MultiRegionMonitor:
             logger.error(f"Error deleting bucket configuration: {e}")
             return False
 
-    
+    def detect_and_clean_deletions(self, bucket_name, current_objects):
+    """Detect objects that were deleted and clean up their state"""
+        try:
+            state_prefix = self.config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
+            pattern = f"{state_prefix}{bucket_name}:*"
+        
+            # Get all stored states for this bucket
+            client = self.redis_client.get("slave", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+            stored_keys = client.keys(pattern)
+        
+            if not stored_keys:
+                return 0
+        
+            # Extract object keys from Redis keys
+            stored_objects = {}
+            prefix_len = len(f"{state_prefix}{bucket_name}:")
+        
+            for redis_key in stored_keys:
+                # Extract object key from Redis key
+                object_key = redis_key[prefix_len:]
+                stored_objects[object_key] = redis_key
+        
+            # Find current objects
+            current_object_keys = set(obj["Key"] for obj in current_objects)
+        
+            # Find deleted objects
+            deleted_objects = set(stored_objects.keys()) - current_object_keys
+        
+            # Clean up state for deleted objects
+            if deleted_objects:
+                master_client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
+            
+                # Use pipeline for efficient deletion
+                pipe = master_client.pipeline()
+                for object_key in deleted_objects:
+                    redis_key = stored_objects[object_key]
+                    pipe.delete(redis_key)
+                    logger.info(f"Cleaning up state for deleted object: {bucket_name}/{object_key}")
+            
+                pipe.execute()
+                logger.info(f"Cleaned up {len(deleted_objects)} deleted objects from bucket {bucket_name}")
+            
+                return len(deleted_objects)
+        
+            return 0
+        
+        except Exception as e:
+            logger.error(f"Error detecting deletions for bucket {bucket_name}: {e}")
+            return 0
+
+
     def start_health_server(self):
         """Start a simple HTTP server for health checks and API."""
         class APIHandler(http.server.SimpleHTTPRequestHandler):
