@@ -134,7 +134,7 @@ class BucketScanner(threading.Thread):
         try:
             # Get S3 client for this bucket from cache
             endpoint = self.bucket_config.get("endpoint", 
-                      self.global_config.get("defaults", {}).get("endpoint", "us-east-1.linodeobjects.com"))
+                    self.global_config.get("defaults", {}).get("endpoint", "us-east-1.linodeobjects.com"))
             access_key = self.bucket_config.get("access_key")
             secret_key = self.bucket_config.get("secret_key")
             
@@ -152,11 +152,12 @@ class BucketScanner(threading.Thread):
                 "new_objects": 0,
                 "updated_objects": 0,
                 "detected_objects": 0,
-                "deleted_objects": 0,
+                "deleted_objects": 0,  
                 "errors": 0,
                 "scan_duration": 0
             }
-
+            
+            # CHANGE: First, collect all current objects before processing
             all_current_objects = []
             
             # Use paginator to handle buckets with many objects
@@ -164,102 +165,116 @@ class BucketScanner(threading.Thread):
             page_iterator = paginator.paginate(Bucket=bucket_name)
             
             for page in page_iterator:
-                if "Contents" not in page:
-                    continue
-                    
-                for obj in page["Contents"]:
-                    stats["objects_scanned"] += 1
+                if "Contents" in page:
+                    all_current_objects.extend(page["Contents"])
                     
                     # Check if we've hit the batch limit
                     max_objects = self.global_config.get("defaults", {}).get("max_objects_per_batch", 1000)
-                    if stats["objects_scanned"] >= max_objects:
+                    if len(all_current_objects) >= max_objects:
                         logger.info(f"Reached max objects per batch for {bucket_name}, will resume in next scan")
+                        all_current_objects = all_current_objects[:max_objects]
                         break
-                    
-                    object_key = obj["Key"]
-                    object_etag = obj["ETag"].strip('"')
-                    object_modified = obj["LastModified"].timestamp()
-                    
-                    # Get stored state
-                    state = get_object_state(self.redis_client, self.global_config, bucket_name, object_key)
-                    
-                    # Determine if object is new or updated
-                    is_missing_state = state is None
-                    is_updated = False
-                    
-                    if not is_missing_state:
-                        # We have state, check if updated
-                        is_updated = (state.get("etag") != object_etag or 
-                                    state.get("last_modified", 0) < object_modified)
-                    
-                    # For objects missing state, determine if truly new based on timestamp
-                    current_time = time.time()
-                    recent_threshold = 86400  # 24 hours in seconds
-                    is_truly_new = is_missing_state and (current_time - object_modified <= recent_threshold)
-                    
-                    # Determine appropriate event type
-                    if is_truly_new:
-                        event_type = "created"
-                    elif is_missing_state:
-                        # Object is not recent but missing state - likely state expired
+            
+            # ADD: Detect and clean up deleted objects
+            monitor = self.global_config.get('monitor_instance')
+            if monitor:
+                deleted_count = monitor.detect_and_clean_deletions(bucket_name, all_current_objects)
+                stats["deleted_objects"] = deleted_count
+            else:
+                logger.warning("Monitor instance not available for deletion detection")
+            
+            # CHANGE: Now process the collected objects
+            for obj in all_current_objects:
+                stats["objects_scanned"] += 1
+                
+                object_key = obj["Key"]
+                object_etag = obj["ETag"].strip('"')
+                object_modified = obj["LastModified"].timestamp()
+                
+                # Get stored state
+                state = get_object_state(self.redis_client, self.global_config, bucket_name, object_key)
+                
+                # Determine if object is new or updated
+                is_missing_state = state is None
+                is_updated = False
+                
+                if not is_missing_state:
+                    # We have state, check if updated
+                    is_updated = (state.get("etag") != object_etag or 
+                                state.get("last_modified", 0) < object_modified)
+                
+                # For objects missing state, determine if truly new based on timestamp
+                current_time = time.time()
+                recent_threshold = 86400  # 24 hours in seconds
+                is_truly_new = is_missing_state and (current_time - object_modified <= recent_threshold)
+                
+                # Determine appropriate event type
+                if is_truly_new:
+                    event_type = "created"
+                elif is_missing_state:
+                    # CHANGE: Check if it's a recent upload (within last 5 minutes)
+                    if current_time - object_modified <= 300:  # 5 minutes
+                        event_type = "created"  # Treat as new if recently uploaded
+                    else:
                         event_type = "detected"
-                    elif is_updated:
-                        event_type = "updated"
+                elif is_updated:
+                    event_type = "updated"
+                else:
+                    # No change detected, skip
+                    continue
+                
+                # Process change
+                # Get object details (only if needed)
+                details = {}
+                try:
+                    details = s3_client.head_object(
+                        Bucket=bucket_name, 
+                        Key=object_key
+                    )
+                except Exception as e:
+                    logger.error(f"Error getting details for {bucket_name}/{object_key}: {e}")
+                    stats["errors"] += 1
+                
+                # Create notification message
+                message = {
+                    "bucket": bucket_name,
+                    "key": object_key,
+                    "region": endpoint,
+                    "etag": object_etag,
+                    "size": obj["Size"],
+                    "last_modified": object_modified,
+                    "event_type": event_type,
+                    "content_type": details.get("ContentType", "application/octet-stream"),
+                    "metadata": details.get("Metadata", {}),
+                    "detection_time": scan_time,
+                    "is_recent": current_time - object_modified <= recent_threshold,
+                    "retry_count": 0
+                }
+                
+                # Check if notifications are enabled for this bucket
+                if is_bucket_notifications_enabled(self.redis_client, bucket_name):
+                    # Publish to queue
+                    if publish_notification(self.redis_client, self.global_config, message):
+                        # Update state after successful queue publish
+                        save_object_state(self.redis_client, self.global_config, bucket_name, object_key, {
+                            "etag": object_etag,
+                            "last_modified": object_modified,
+                            "size": obj["Size"],
+                            "last_processed": scan_time,
+                            "last_seen": scan_time 
+                        })
+                        
+                        # Update statistics based on event type
+                        if event_type == "created":
+                            stats["new_objects"] += 1
+                        elif event_type == "updated":
+                            stats["updated_objects"] += 1
+                        elif event_type == "detected":
+                            stats["detected_objects"] += 1
                     else:
-                        # No change detected, skip
-                        continue
-                    
-                    # Process change
-                    # Get object details (only if needed)
-                    details = {}
-                    try:
-                        details = s3_client.head_object(
-                            Bucket=bucket_name, 
-                            Key=object_key
-                        )
-                    except Exception as e:
-                        logger.error(f"Error getting details for {bucket_name}/{object_key}: {e}")
-                        stats["errors"] += 1
-                    
-                    # Create notification message
-                    message = {
-                        "bucket": bucket_name,
-                        "key": object_key,
-                        "region": endpoint,
-                        "etag": object_etag,
-                        "size": obj["Size"],
-                        "last_modified": object_modified,
-                        "event_type": event_type,
-                        "content_type": details.get("ContentType", "application/octet-stream"),
-                        "metadata": details.get("Metadata", {}),
-                        "detection_time": scan_time,
-                        "is_recent": current_time - object_modified <= recent_threshold,
-                        "retry_count": 0
-                    }
-                    
-                    # Check if notifications are enabled for this bucket
-                    if is_bucket_notifications_enabled(self.redis_client, bucket_name):
-                        # Publish to queue
-                        if publish_notification(self.redis_client, self.global_config, message):
-                            # Update state after successful queue publish
-                            save_object_state(self.redis_client, self.global_config, bucket_name, object_key, {
-                                "etag": object_etag,
-                                "last_modified": object_modified,
-                                "size": obj["Size"],
-                                "last_processed": scan_time
-                            })
-                            
-                            # Update statistics based on event type
-                            if event_type == "created":
-                                stats["new_objects"] += 1
-                            elif event_type == "updated":
-                                stats["updated_objects"] += 1
-                            elif event_type == "detected":
-                                stats["detected_objects"] += 1
-                        else:
-                            logger.debug(f"Failed to publish notification for {bucket_name}/{object_key}")
-                    else:
-                        logger.debug(f"Skipping notification for {bucket_name}/{object_key} (notifications disabled)")
+                        logger.debug(f"Failed to publish notification for {bucket_name}/{object_key}")
+                else:
+                    logger.debug(f"Skipping notification for {bucket_name}/{object_key} (notifications disabled)")
             
             # Update last scan time
             # Use redis master explicitly for this write operation
@@ -272,10 +287,12 @@ class BucketScanner(threading.Thread):
             # Add result to queue
             self.result_queue.put(stats)
             
+            # CHANGE: Updated log message to include deleted objects
             logger.info(
                 f"Bucket {bucket_name} scan complete: "
                 f"{stats['new_objects']} new, {stats['updated_objects']} updated, "
-                f"{stats['detected_objects']} detected, {stats['objects_scanned']} scanned, "
+                f"{stats['detected_objects']} detected, {stats['deleted_objects']} deleted, "
+                f"{stats['objects_scanned']} scanned, "
                 f"in {stats['scan_duration']:.2f}s"
             )
             
@@ -509,9 +526,13 @@ class MultiRegionMonitor:
     def scan_bucket(self, bucket_config):
         """Scan a bucket using a thread from the region's thread pool."""
         result_queue = queue.Queue()
+
+        config_with_monitor = self.config.copy()
+        config_with_monitor['monitor_instance'] = self
         scanner = BucketScanner(
             bucket_config,
             self.redis_client,
+            config_with_monitor,
             self.config,
             result_queue,
             self.client_cache
@@ -594,6 +615,10 @@ class MultiRegionMonitor:
         self.scan_stats["total_scans"] += 1
         self.scan_stats["last_scan_time"] = time.time()
         
+        # Initialize deleted objects counter if it doesn't exist
+        if "total_deleted_objects" not in self.scan_stats:
+            self.scan_stats["total_deleted_objects"] = 0
+        
         # Track scan durations (last 10)
         scan_durations = [r.get("scan_duration", 0) for r in results if "scan_duration" in r]
         if scan_durations:
@@ -611,6 +636,7 @@ class MultiRegionMonitor:
             self.scan_stats["total_new_objects"] += result.get("new_objects", 0)
             self.scan_stats["total_updated_objects"] += result.get("updated_objects", 0)
             self.scan_stats["total_detected_objects"] += result.get("detected_objects", 0)
+            self.scan_stats["total_deleted_objects"] += result.get("deleted_objects", 0) 
 
     def add_bucket_to_active_config(self, bucket_info):
         """Add a new bucket to the active configuration."""
@@ -781,7 +807,7 @@ class MultiRegionMonitor:
             return False
 
     def detect_and_clean_deletions(self, bucket_name, current_objects):
-    """Detect objects that were deleted and clean up their state"""
+        """Detect objects that were deleted and clean up their state"""
         try:
             state_prefix = self.config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
             pattern = f"{state_prefix}{bucket_name}:*"
