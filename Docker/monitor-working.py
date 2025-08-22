@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# This version works for all the use cases apart from the created and updated event type workflow 
 """
 Linode Object Storage Monitor
 
@@ -144,6 +145,9 @@ class BucketScanner(threading.Thread):
             
             # Record scan time
             scan_time = datetime.now().timestamp()
+            current_time = time.time()
+            recent_threshold = 86400  # 24 hours
+            grace_period = 300  # 5 minutes
             
             # Track counts for this bucket
             stats = {
@@ -157,7 +161,7 @@ class BucketScanner(threading.Thread):
                 "scan_duration": 0
             }
             
-            # CHANGE: First, collect all current objects before processing
+            # First, collect all current objects before processing
             all_current_objects = []
             
             # Use paginator to handle buckets with many objects
@@ -175,21 +179,32 @@ class BucketScanner(threading.Thread):
                         all_current_objects = all_current_objects[:max_objects]
                         break
             
-            # ADD: Detect and clean up deleted objects
+            # Detect and clean up deleted objects
             monitor = self.global_config.get('monitor_instance')
             if monitor:
-                deleted_count = monitor.detect_and_clean_deletions(bucket_name, all_current_objects)
+                #deleted_count = monitor.detect_and_clean_deletions(bucket_name, all_current_objects)
+                max_objects = self.global_config.get("defaults", {}).get("max_objects_per_batch", 1000)
+                is_complete_scan = len(all_current_objects) < max_objects
+                deleted_count = monitor.detect_and_clean_deletions(bucket_name, all_current_objects, is_complete_scan)
+
                 stats["deleted_objects"] = deleted_count
             else:
                 logger.warning("Monitor instance not available for deletion detection")
             
-            # CHANGE: Now process the collected objects
+            # Process the collected objects
+            notifications_enabled = is_bucket_notifications_enabled(self.redis_client, bucket_name)
+            
             for obj in all_current_objects:
-                stats["objects_scanned"] += 1
-                
+                # Validate object data
+                if not all(key in obj for key in ["Key", "ETag", "LastModified"]):
+                    logger.error(f"Invalid object data in {bucket_name}: {obj}")
+                    stats["errors"] += 1
+                    continue
+                    
                 object_key = obj["Key"]
                 object_etag = obj["ETag"].strip('"')
                 object_modified = obj["LastModified"].timestamp()
+                time_since_modified = current_time - object_modified
                 
                 # Get stored state
                 state = get_object_state(self.redis_client, self.global_config, bucket_name, object_key)
@@ -203,37 +218,35 @@ class BucketScanner(threading.Thread):
                     is_updated = (state.get("etag") != object_etag or 
                                 state.get("last_modified", 0) < object_modified)
                 
-                # For objects missing state, determine if truly new based on timestamp
-                current_time = time.time()
-                recent_threshold = 86400  # 24 hours in seconds
-                is_truly_new = is_missing_state and (current_time - object_modified <= recent_threshold)
-                
                 # Determine appropriate event type
-                if is_truly_new:
-                    event_type = "created"
-                elif is_missing_state:
-                    # CHANGE: Check if it's a recent upload (within last 5 minutes)
-                    if current_time - object_modified <= 300:  # 5 minutes
-                        event_type = "created"  # Treat as new if recently uploaded
+                event_type = None
+                if is_missing_state:
+                    if time_since_modified <= recent_threshold:
+                        event_type = "created"
+                    elif time_since_modified <= grace_period:
+                        event_type = "created"  # 5-minute grace period
                     else:
                         event_type = "detected"
                 elif is_updated:
                     event_type = "updated"
-                else:
-                    # No change detected, skip
-                    continue
+                # else: no change, skip
                 
-                # Process change
-                # Get object details (only if needed)
-                details = {}
-                try:
-                    details = s3_client.head_object(
-                        Bucket=bucket_name, 
-                        Key=object_key
-                    )
-                except Exception as e:
-                    logger.error(f"Error getting details for {bucket_name}/{object_key}: {e}")
-                    stats["errors"] += 1
+                if event_type is None:
+                    continue  # Skip unchanged objects
+                
+                # Now we're processing this object
+                stats["objects_scanned"] += 1
+                
+                # Get object details only if we need them
+                details = {"ContentType": "application/octet-stream", "Metadata": {}}
+
+                if event_type in ["created", "updated"]:
+                    try:
+                        details = s3_client.head_object(Bucket=bucket_name, Key=object_key)
+                    except Exception as e:
+                        logger.error(f"Error getting details for {bucket_name}/{object_key}: {e}")
+                        stats["errors"] += 1
+                        # Keep defaults
                 
                 # Create notification message
                 message = {
@@ -247,23 +260,13 @@ class BucketScanner(threading.Thread):
                     "content_type": details.get("ContentType", "application/octet-stream"),
                     "metadata": details.get("Metadata", {}),
                     "detection_time": scan_time,
-                    "is_recent": current_time - object_modified <= recent_threshold,
+                    "is_recent": time_since_modified <= recent_threshold,
                     "retry_count": 0
                 }
                 
-                # Check if notifications are enabled for this bucket
-                if is_bucket_notifications_enabled(self.redis_client, bucket_name):
-                    # Publish to queue
+                # Publish notification if enabled
+                if notifications_enabled:
                     if publish_notification(self.redis_client, self.global_config, message):
-                        # Update state after successful queue publish
-                        save_object_state(self.redis_client, self.global_config, bucket_name, object_key, {
-                            "etag": object_etag,
-                            "last_modified": object_modified,
-                            "size": obj["Size"],
-                            "last_processed": scan_time,
-                            "last_seen": scan_time 
-                        })
-                        
                         # Update statistics based on event type
                         if event_type == "created":
                             stats["new_objects"] += 1
@@ -275,9 +278,17 @@ class BucketScanner(threading.Thread):
                         logger.debug(f"Failed to publish notification for {bucket_name}/{object_key}")
                 else:
                     logger.debug(f"Skipping notification for {bucket_name}/{object_key} (notifications disabled)")
+                
+                # Always update state regardless of notification status
+                save_object_state(self.redis_client, self.global_config, bucket_name, object_key, {
+                    "etag": object_etag,
+                    "last_modified": object_modified,
+                    "size": obj["Size"],
+                    "last_processed": scan_time,
+                    "last_seen": scan_time 
+                })
             
             # Update last scan time
-            # Use redis master explicitly for this write operation
             master_client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
             master_client.set(f"linode:objstore:last_scan:{bucket_name}", scan_time)
             
@@ -287,7 +298,6 @@ class BucketScanner(threading.Thread):
             # Add result to queue
             self.result_queue.put(stats)
             
-            # CHANGE: Updated log message to include deleted objects
             logger.info(
                 f"Bucket {bucket_name} scan complete: "
                 f"{stats['new_objects']} new, {stats['updated_objects']} updated, "
@@ -341,14 +351,18 @@ class MultiRegionMonitor:
         
         # Track scan metrics
         self.scan_stats = {
-            "total_scans": 0,
+            "total_scans": 0,  # or "successful_scans" 
+            "total_scan_attempts": 0,  # if tracking both
+            "failed_scans": 0,  # if tracking both
             "total_objects_scanned": 0,
             "total_new_objects": 0,
             "total_updated_objects": 0,
             "total_detected_objects": 0,
+            "total_deleted_objects": 0,  
             "errors": 0,
             "last_scan_time": 0,
-            "scan_durations": []  # Last 10 scan durations
+            "scan_durations": [],
+            "success_rate": 1.0  # if tracking success rate
         }
 
     def refresh_config_from_redis(self):
@@ -533,7 +547,6 @@ class MultiRegionMonitor:
             bucket_config,
             self.redis_client,
             config_with_monitor,
-            self.config,
             result_queue,
             self.client_cache
         )
@@ -611,32 +624,40 @@ class MultiRegionMonitor:
         """Update overall scan statistics from bucket scan results."""
         if not results:
             return
-            
-        self.scan_stats["total_scans"] += 1
+        
+        # Count scan attempts and successes
+        total_attempts = len(results)
+        successful_results = [r for r in results if "error" not in r]
+        error_results = [r for r in results if "error" in r]
+        
+        self.scan_stats["total_scans"] += len(successful_results)  # Only successful scans
+        self.scan_stats["errors"] += len(error_results)  # Count errors here
         self.scan_stats["last_scan_time"] = time.time()
         
-        # Initialize deleted objects counter if it doesn't exist
-        if "total_deleted_objects" not in self.scan_stats:
-            self.scan_stats["total_deleted_objects"] = 0
+        # Track scan durations (only successful scans)
+        successful_durations = [
+            r.get("scan_duration", 0) 
+            for r in successful_results 
+            if "scan_duration" in r and isinstance(r["scan_duration"], (int, float)) and r["scan_duration"] > 0
+        ]
         
-        # Track scan durations (last 10)
-        scan_durations = [r.get("scan_duration", 0) for r in results if "scan_duration" in r]
-        if scan_durations:
-            avg_duration = sum(scan_durations) / len(scan_durations)
-            self.scan_stats["scan_durations"].append(avg_duration)
+        # Store individual durations (last 10)
+        for duration in successful_durations:
+            self.scan_stats["scan_durations"].append(duration)
             if len(self.scan_stats["scan_durations"]) > 10:
                 self.scan_stats["scan_durations"].pop(0)
         
-        # Sum up object counts
-        for result in results:
-            if "error" in result:
-                continue
-                
+        # Sum up object counts (only from successful scans)
+        for result in successful_results:
             self.scan_stats["total_objects_scanned"] += result.get("objects_scanned", 0)
             self.scan_stats["total_new_objects"] += result.get("new_objects", 0)
             self.scan_stats["total_updated_objects"] += result.get("updated_objects", 0)
             self.scan_stats["total_detected_objects"] += result.get("detected_objects", 0)
-            self.scan_stats["total_deleted_objects"] += result.get("deleted_objects", 0) 
+            self.scan_stats["total_deleted_objects"] += result.get("deleted_objects", 0)
+    
+        # Optional: Log summary for debugging
+        if error_results:
+            logger.debug(f"Scan summary: {len(successful_results)} successful, {len(error_results)} failed")
 
     def add_bucket_to_active_config(self, bucket_info):
         """Add a new bucket to the active configuration."""
@@ -806,15 +827,25 @@ class MultiRegionMonitor:
             logger.error(f"Error deleting bucket configuration: {e}")
             return False
 
-    def detect_and_clean_deletions(self, bucket_name, current_objects):
+    def detect_and_clean_deletions(self, bucket_name, current_objects, is_complete_scan=True):
         """Detect objects that were deleted and clean up their state"""
         try:
+            # Input validation
+            if not bucket_name or not isinstance(current_objects, list):
+                logger.error(f"Invalid input: bucket_name='{bucket_name}', current_objects type={type(current_objects)}")
+                return 0
+            
+            # Skip deletion detection for incomplete scans
+            if not is_complete_scan:
+                logger.debug(f"Skipping deletion detection for {bucket_name} (incomplete scan)")
+                return 0
+                
             state_prefix = self.config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
             pattern = f"{state_prefix}{bucket_name}:*"
         
-            # Get all stored states for this bucket
+            # Get all stored states for this bucket using SCAN (not KEYS)
             client = self.redis_client.get("slave", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
-            stored_keys = client.keys(pattern)
+            stored_keys = self._scan_keys(client, pattern)
         
             if not stored_keys:
                 return 0
@@ -824,12 +855,20 @@ class MultiRegionMonitor:
             prefix_len = len(f"{state_prefix}{bucket_name}:")
         
             for redis_key in stored_keys:
+                # Handle both bytes and string responses
+                if isinstance(redis_key, bytes):
+                    redis_key = redis_key.decode('utf-8')
+                
                 # Extract object key from Redis key
-                object_key = redis_key[prefix_len:]
-                stored_objects[object_key] = redis_key
+                if len(redis_key) > prefix_len:
+                    object_key = redis_key[prefix_len:]
+                    stored_objects[object_key] = redis_key
         
             # Find current objects
-            current_object_keys = set(obj["Key"] for obj in current_objects)
+            current_object_keys = set()
+            for obj in current_objects:
+                if isinstance(obj, dict) and "Key" in obj:
+                    current_object_keys.add(obj["Key"])
         
             # Find deleted objects
             deleted_objects = set(stored_objects.keys()) - current_object_keys
@@ -843,18 +882,46 @@ class MultiRegionMonitor:
                 for object_key in deleted_objects:
                     redis_key = stored_objects[object_key]
                     pipe.delete(redis_key)
-                    logger.info(f"Cleaning up state for deleted object: {bucket_name}/{object_key}")
             
                 pipe.execute()
-                logger.info(f"Cleaned up {len(deleted_objects)} deleted objects from bucket {bucket_name}")
+                
+                # Log summary
+                logger.info(f"Cleaned up state for {len(deleted_objects)} deleted objects from bucket {bucket_name}")
+                
+                # Debug logging for first few objects
+                if logger.level <= 10:
+                    sample_objects = list(deleted_objects)[:5]
+                    for obj_key in sample_objects:
+                        logger.debug(f"Deleted state: {bucket_name}/{obj_key}")
+                    if len(deleted_objects) > 5:
+                        logger.debug(f"... and {len(deleted_objects) - 5} more objects")
             
                 return len(deleted_objects)
         
             return 0
         
+        
         except Exception as e:
-            logger.error(f"Error detecting deletions for bucket {bucket_name}: {e}")
+            logger.error(f"Unexpected error detecting deletions for bucket {bucket_name}: {e}", exc_info=True)
             return 0
+
+    def _scan_keys(self, client, pattern):
+        """Use SCAN instead of KEYS for better performance."""
+        keys = []
+        cursor = 0
+        
+        try:
+            while True:
+                cursor, batch_keys = client.scan(cursor=cursor, match=pattern, count=1000)
+                keys.extend(batch_keys)
+                if cursor == 0:
+                    break
+        except Exception as e:
+            logger.warning(f"SCAN failed, falling back to KEYS: {e}")
+            # Fallback to KEYS if SCAN fails
+            keys = client.keys(pattern)
+        
+        return keys
 
 
     def start_health_server(self):
