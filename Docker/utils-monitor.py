@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Utility functions for the Linode Object Storage Monitoring System.
 With Redis Sentinel support for high availability.
