@@ -24,7 +24,7 @@ INFISICAL_PROJECT_ID = os.getenv("INFISICAL_PROJECT_ID")
 INFISICAL_ENV = os.getenv("INFISICAL_ENV", "dev")
 
 _infisical_cache = {}
-_cache_ttl = 300  # 5 minutes
+_cache_ttl = 3600  # 5 minutes
 
 # Configure logging
 def setup_logging(name, level=None):
