@@ -182,11 +182,9 @@ class BucketScanner(threading.Thread):
             # Detect and clean up deleted objects
             monitor = self.global_config.get('monitor_instance')
             if monitor:
-                #deleted_count = monitor.detect_and_clean_deletions(bucket_name, all_current_objects)
                 max_objects = self.global_config.get("defaults", {}).get("max_objects_per_batch", 1000)
                 is_complete_scan = len(all_current_objects) < max_objects
                 deleted_count = monitor.detect_and_clean_deletions(bucket_name, all_current_objects, is_complete_scan)
-
                 stats["deleted_objects"] = deleted_count
             else:
                 logger.warning("Monitor instance not available for deletion detection")
@@ -351,9 +349,9 @@ class MultiRegionMonitor:
         
         # Track scan metrics
         self.scan_stats = {
-            "total_scans": 0,  # or "successful_scans" 
-            "total_scan_attempts": 0,  # if tracking both
-            "failed_scans": 0,  # if tracking both
+            "total_scans": 0,
+            "total_scan_attempts": 0,
+            "failed_scans": 0,
             "total_objects_scanned": 0,
             "total_new_objects": 0,
             "total_updated_objects": 0,
@@ -362,18 +360,29 @@ class MultiRegionMonitor:
             "errors": 0,
             "last_scan_time": 0,
             "scan_durations": [],
-            "success_rate": 1.0  # if tracking success rate
+            "success_rate": 1.0
         }
+
+        # Start background refresh
+        self.start_background_refresh()
 
     def refresh_config_from_redis(self):
         """Refresh configuration from Redis but get credentials from Infisical"""
         logger.info("Refreshing configuration from Redis and Infisical")
         
         client = self.redis_client.get("master", self.redis_client) if isinstance(self.redis_client, dict) else self.redis_client
-        all_bucket_keys = client.keys("linode:objstore:config:bucket:*")
         
-        new_buckets = []
-        
+        # Use SCAN instead of KEYS
+        all_bucket_keys = []
+        cursor = 0
+        while True:
+            cursor, keys = client.scan(cursor=cursor, match="linode:objstore:config:bucket:*", count=100)
+            all_bucket_keys.extend(keys)
+            if cursor == 0:
+                break
+
+        # Load all bucket configs from Redis first
+        bucket_configs = []
         for key in all_bucket_keys:
             bucket_data = client.get(key)
             if bucket_data:
@@ -381,25 +390,58 @@ class MultiRegionMonitor:
                     if isinstance(bucket_data, bytes):
                         bucket_data = bucket_data.decode('utf-8')
                     bucket_config = json.loads(bucket_data)
-                    
-                    # Get credentials from Infisical
-                    bucket_name = bucket_config['name']
-                    infisical_creds = get_bucket_credentials_from_infisical(bucket_name)
-                    
-                    if infisical_creds:
-                        bucket_config['access_key'] = infisical_creds['access_key']
-                        bucket_config['secret_key'] = infisical_creds['secret_key']
-                        logger.debug(f"Loaded credentials from Infisical for {bucket_name}")
-                    else:
-                        logger.warning(f"No Infisical credentials for {bucket_name}, using stored values")
-                    
-                    new_buckets.append(bucket_config)
+                    bucket_configs.append(bucket_config)
                 except json.JSONDecodeError:
                     logger.error(f"Error decoding JSON from Redis for key {key}")
+
+        # Fetch credentials in parallel
+        def fetch_credentials_for_bucket(bucket_config):
+            bucket_name = bucket_config['name']
+            try:
+                infisical_creds = get_bucket_credentials_from_infisical(bucket_name)
+                if infisical_creds:
+                    bucket_config['access_key'] = infisical_creds['access_key']
+                    bucket_config['secret_key'] = infisical_creds['secret_key']
+                return bucket_config
+            except Exception as e:
+                logger.error(f"Error fetching credentials for {bucket_name}: {e}")
+                return bucket_config
+
+        new_buckets = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_bucket = {
+                executor.submit(fetch_credentials_for_bucket, bucket_config): bucket_config
+                for bucket_config in bucket_configs
+            }
+
+            for future in as_completed(future_to_bucket):
+                try:
+                    updated_bucket = future.result()
+                    new_buckets.append(updated_bucket)
+                except Exception as e:
+                    original_bucket = future_to_bucket[future]
+                    logger.error(f"Failed to fetch credentials for {original_bucket['name']}: {e}")
+                    new_buckets.append(original_bucket)
         
         self.config["buckets"] = new_buckets
         logger.info(f"Refreshed configuration: {len(new_buckets)} buckets loaded")
     
+    def start_background_refresh(self):
+        """Start background thread to refresh config every 15 minutes"""
+        def background_refresh():
+            while self.running:
+                try:
+                    time.sleep(300)  # 5 minutes
+                    logger.info("Starting background config refresh")
+                    self.refresh_config_from_redis()
+                    logger.info("Background config refresh completed")
+                except Exception as e:
+                    logger.error(f"Background refresh failed: {e}")
+
+        refresh_thread = threading.Thread(target=background_refresh, daemon=True)
+        refresh_thread.start()
+        logger.info("Started background config refresh thread")
+
     def handle_signal(self, signum, frame):
         """Handle termination signals."""
         logger.info(f"Received signal {signum}, shutting down gracefully...")
@@ -479,7 +521,6 @@ class MultiRegionMonitor:
         
         for region in self.get_all_regions():
             logger.info(f"Initializing thread pool for region {region} with {rate_limit_per_region} workers")
-
             self.region_thread_pools[region] = ThreadPoolExecutor(max_workers=rate_limit_per_region)
     
     def get_all_regions(self):
@@ -663,91 +704,58 @@ class MultiRegionMonitor:
         """Add a new bucket to the active configuration."""
         try:
             logger.info(f"Starting to add bucket: {bucket_info.get('name')}")
-            # Format the bucket info correctly
-
-            logger.info(f"Input bucket_info keys: {list(bucket_info.keys())}")
-
             bucket_config = bucket_info.copy()
 
-            #logger.info(f"Has client_id: {'client_id' in bucket_info}, Value: {bucket_info.get('client_id', 'None')}")
-            #logger.info(f"Has client_secret: {'client_secret' in bucket_info}, Value: {'<present>' if 'client_secret' in bucket_info else 'None'}")
-            #logger.info(f"Has token_url: {'token_url' in bucket_info}, Value: {bucket_info.get('token_url', 'None')}")
-
-            """bucket_config = {
-                "name": bucket_info["name"],
-                "access_key": bucket_info["access_key"],
-                "secret_key": bucket_info["secret_key"],
-                "endpoint": bucket_info.get("region", bucket_info.get("endpoint")),
-                "webhook_url": bucket_info["webhook_url"],
-                "status": "active",
-                "added_at": datetime.now().isoformat()
-            }"""
-
-
-            
             # Add authentication details if provided
-            """
-            if "client_id" in bucket_info and "client_secret" in bucket_info and "token_url" in bucket_info:
-                bucket_config["webhook_auth"] = {
-                    "type": "oauth2",
-                    "client_id": bucket_info["client_id"],
-                    "client_secret": bucket_info["client_secret"],
-                    "token_url": bucket_info.get("token_url")
-                }"""
-            # Add authentication details if provided - SIMPLIFIED APPROACH
             if "client_id" in bucket_info:
-                # Initialize webhook_auth if not present
                 if "webhook_auth" not in bucket_config:
                     bucket_config["webhook_auth"] = {"type": "oauth2"}
-
                 bucket_config["webhook_auth"]["client_id"] = bucket_info["client_id"]
 
             if "client_secret" in bucket_info:
-                # Initialize webhook_auth if not present
                 if "webhook_auth" not in bucket_config:
                     bucket_config["webhook_auth"] = {"type": "oauth2"}
-
                 bucket_config["webhook_auth"]["client_secret"] = bucket_info["client_secret"]
 
             if "token_url" in bucket_info:
-                # Initialize webhook_auth if not present
                 if "webhook_auth" not in bucket_config:
                     bucket_config["webhook_auth"] = {"type": "oauth2"}
-
                 bucket_config["webhook_auth"]["token_url"] = bucket_info["token_url"]
 
-            # Log the final bucket config before saving
             logger.info(f"Final bucket config before Redis save: {json.dumps(bucket_config, default=str)}")
             
-            # Add to Redis for persistence (NO TTL)
+            # Save to Redis
             logger.info(f"Saving bucket config to Redis: {bucket_config.get('name')}")
             redis_result = save_bucket_config(self.redis_client, bucket_config)
-
             if not redis_result:
                 logger.error(f"Failed to save bucket config to Redis: {bucket_config.get('name')}")
                 return False
             
+            # Get credentials for just this new bucket
+            bucket_name = bucket_config['name']
+            infisical_creds = get_bucket_credentials_from_infisical(bucket_name)
+            if infisical_creds:
+                bucket_config['access_key'] = infisical_creds['access_key']
+                bucket_config['secret_key'] = infisical_creds['secret_key']
+                logger.debug(f"Loaded credentials from Infisical for {bucket_name}")
+            else:
+                logger.warning(f"No Infisical credentials for {bucket_name}, using stored values")
+
             # Add to in-memory configuration
-            logger.info(f"Adding bucket to in-memory config: {bucket_config.get('name')}")
             self.config.setdefault("buckets", []).append(bucket_config)
-            
-            # Initialize scan metadata for this bucket
-            logger.info(f"Initializing scan metadata for bucket: {bucket_config.get('name')}")
+
+            # Initialize scan metadata
             polling_interval = self.config.get("defaults", {}).get("polling_interval", 60)
-            self.bucket_offsets[bucket_config["name"]] = random.randint(0, polling_interval - 1)
-            #self.bucket_offsets[bucket_info["name"]] = random.randint(
-             #   0, self.config.get("defaults", {}).get("polling_interval", 60) - 1
-            #)
+            self.bucket_offsets[bucket_name] = random.randint(0, polling_interval - 1)
             
-            # If the bucket's region is new, create a thread pool for it
+            # Create thread pool for new region if needed
             endpoint = bucket_config["endpoint"]
-            logger.info(f"Checking thread pool for region: {endpoint}")
             if endpoint not in self.region_thread_pools:
                 rate_limit = self.config.get("parallel", {}).get("rate_limit_per_region", 15)
                 self.region_thread_pools[endpoint] = ThreadPoolExecutor(max_workers=rate_limit)
                 logger.info(f"Created new thread pool for region {endpoint}")
-            
-            logger.info(f"Added new bucket {bucket_config['name']} to active configuration")
+
+            logger.info(f"Added new bucket {bucket_config['name']} incrementally")
             return True
             
         except Exception as e:
@@ -900,7 +908,6 @@ class MultiRegionMonitor:
         
             return 0
         
-        
         except Exception as e:
             logger.error(f"Unexpected error detecting deletions for bucket {bucket_name}: {e}", exc_info=True)
             return 0
@@ -922,7 +929,6 @@ class MultiRegionMonitor:
             keys = client.keys(pattern)
         
         return keys
-
 
     def start_health_server(self):
         """Start a simple HTTP server for health checks and API."""
@@ -1001,15 +1007,12 @@ class MultiRegionMonitor:
                     self2.wfile.write(json.dumps(metrics).encode())
                 
                 elif self2.path == '/api/bucket-notifications/status':
-
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
                         return
                     
-                    self.refresh_config_from_redis()
-                    
-                    # Get notification status for all buckets
+                    # Use existing in-memory config - NO REFRESH NEEDED
                     statuses = []
                     for bucket_config in self.config.get("buckets", []):
                         bucket_name = bucket_config["name"]
@@ -1145,10 +1148,8 @@ class MultiRegionMonitor:
                             logger.critical("Failed to send error response", exc_info=True)
 
                     return
-
                 
                 if parsed_url.path == '/api/bucket-notifications/disable':
-
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -1188,7 +1189,6 @@ class MultiRegionMonitor:
                     }).encode())
                     
                 elif parsed_url.path == '/api/bucket-notifications/enable':
-
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -1229,7 +1229,6 @@ class MultiRegionMonitor:
 
                 # Add a new bucket
                 elif parsed_url.path == '/api/buckets/add':
-
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -1318,9 +1317,7 @@ class MultiRegionMonitor:
                         success = self.add_bucket_to_active_config(bucket_config)
 
                         if success:
-                            # Refresh from Redis to ensure consistency
-                            self.refresh_config_from_redis()
-                            
+                            # DO NOT call refresh here - bucket already added incrementally
                             self2.send_response(201)  # Created
                             self2.send_header('Content-Type', 'application/json')
                             self2.end_headers()
@@ -1356,7 +1353,6 @@ class MultiRegionMonitor:
 
                 # Update an existing bucket
                 elif parsed_url.path == '/api/buckets/update':
-
                     # Authenticate request
                     payload = self2.authenticate_request()
                     if not payload:
@@ -1442,8 +1438,6 @@ class MultiRegionMonitor:
                                 
                                 # Save to Redis (without S3 credentials)
                                 save_bucket_config(self.redis_client, self.config["buckets"][i])
-
-                                self.refresh_config_from_redis()
                                 
                                 # If endpoint changed, clear client cache
                                 if "region" in data or "endpoint" in data:
@@ -1478,7 +1472,6 @@ class MultiRegionMonitor:
                         self2.wfile.write(json.dumps({
                             "error": "Invalid JSON payload"
                         }).encode()) 
-
 
                 elif parsed_url.path == '/api/buckets/delete':
                     # Authenticate request
