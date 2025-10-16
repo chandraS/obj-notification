@@ -1,596 +1,762 @@
 #!/usr/bin/env python3
 """
-Webhook Consumer for Linode Object Storage Monitor
-
-This script reads notifications from the Redis queue and
-delivers them to the configured webhook endpoint.
-It handles retries, circuit breaking, and rate limiting.
-
-Supports Redis Sentinel for high availability.
+Utility functions for the Linode Object Storage Monitoring System.
+With Redis Sentinel support for high availability.
 """
 
 import json
+import logging
+import base64
+import requests
 import os
 import time
-import base64
-import threading
-import http.server
-import socketserver
-import requests
-import random
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+import yaml
+import jwt
+import redis
+import socket
+import sys
+from typing import Dict, Optional
+from datetime import datetime, timedelta
+from redis.sentinel import Sentinel
+from datetime import datetime, timedelta
+from pythonjsonlogger import jsonlogger
 
-# Import utility functions
-from utils import (
-    setup_logging,
-    load_config,
-    create_redis_client,
-    get_notifications,
-    check_redis_health,
-    check_queue_stats,
-    check_sentinel_health,
-    get_bucket_webhook_url,
-    get_bucket_config,
-    clear_oauth_token_cache,
-    get_oauth_token
-)
+INFISICAL_API_URL = os.getenv("INFISICAL_API_URL", "https://hmsinfvault.akamai-mco.com").rstrip("/")
+INFISICAL_TOKEN = os.getenv("INFISICAL_TOKEN")
+INFISICAL_PROJECT_ID = os.getenv("INFISICAL_PROJECT_ID")
+INFISICAL_ENV = os.getenv("INFISICAL_ENV", "production")
 
-# Set up logging
-base_logger = setup_logging("webhook-consumer")
+# Add Infisical cache
+_infisical_cache = {}
+_cache_ttl = 300  # 5 minutes
 
-class ContextLogger:
-    def __init__(self, logger):
-        self.logger = logger
+_default_logger = logging.getLogger("utils")
+_handler = logging.StreamHandler()
+_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_handler.setFormatter(_formatter)
+_default_logger.addHandler(_handler)
+_default_logger.setLevel(logging.INFO)
+
+# Configure logging
+def setup_logging(name, level=None):
+    """Set up logging with appropriate format and level."""
+    if level is None:
+        level = os.environ.get("LOG_LEVEL", "INFO").upper()
     
-    def info(self, msg, **kwargs):
-        self.logger.info(msg, extra=kwargs)
+    numeric_level = getattr(logging, level, logging.INFO)
     
-    def debug(self, msg, **kwargs):
-        self.logger.debug(msg, extra=kwargs)
+    # Configure if we should use JSON format
+    use_json = os.environ.get("LOG_FORMAT_JSON", "true").lower() == "true"
     
-    def warning(self, msg, **kwargs):
-        self.logger.warning(msg, extra=kwargs)
+    # Configure logger
+    logger = logging.getLogger(name)
+    logger.setLevel(numeric_level)
     
-    def error(self, msg, **kwargs):
-        self.logger.error(msg, extra=kwargs)
+    # Remove existing handlers to avoid duplicates
+    for hdlr in logger.handlers[:]:
+        logger.removeHandler(hdlr)
     
-    def critical(self, msg, **kwargs):
-        self.logger.critical(msg, extra=kwargs)
-
-logger = ContextLogger(base_logger)
-
-
-class CircuitBreaker:
-    """Circuit breaker pattern implementation for webhook endpoints."""
-    
-    def __init__(self, failure_threshold=5, reset_timeout=60):
-        """Initialize the circuit breaker."""
-        self.failure_threshold = failure_threshold
-        self.reset_timeout = reset_timeout
-        self.failures = 0
-        self.last_failure_time = 0
-        self.state = "closed"  # closed, open, half-open
-        self.lock = threading.Lock()
-    
-    def allow_request(self):
-        """Check if a request should be allowed based on circuit state."""
-        with self.lock:
-            if self.state == "closed":
-                return True
-            elif self.state == "open":
-                # Check if it's time to try again
-                if time.time() - self.last_failure_time > self.reset_timeout:
-                    logger.debug("Circuit half-open, allowing test request")
-                    self.state = "half-open"
-                    return True
-                return False
-            elif self.state == "half-open":
-                return True
-    
-    def record_success(self):
-        """Record a successful request."""
-        with self.lock:
-            if self.state == "half-open":
-                logger.info("Circuit closed after successful test request")
-                self.state = "closed"
-            self.failures = 0
-    
-    def record_failure(self):
-        """Record a failed request."""
-        with self.lock:
-            self.failures += 1
-            self.last_failure_time = time.time()
-            
-            if self.state == "half-open" or (self.state == "closed" and self.failures >= self.failure_threshold):
-                logger.warning(f"Circuit opened after {self.failures} failures")
-                self.state = "open"
-
-class WebhookConsumer:
-    """Consumer that processes queue messages and delivers to webhooks."""
-    
-    def __init__(self):
-        """Initialize the consumer with configuration."""
-        self.config = load_config()
-        self.redis_client = create_redis_client(self.config)
-        
-        # Configure webhook settings
-        webhook_config = self.config.get("webhook", {})
-        self.timeout = webhook_config.get("timeout", 10)
-        self.max_retries = webhook_config.get("max_retries", 3)
-        self.backoff_factor = webhook_config.get("backoff_factor", 2)
-        
-        # Create circuit breakers dictionary (one per webhook URL)
-        self.circuit_breakers = {}
-        
-        # Configure consumer settings
-        consumer_config = self.config.get("consumer", {})
-        self.polling_interval = consumer_config.get("polling_interval", 1)
-        self.batch_size = consumer_config.get("batch_size", 10)
-        self.webhook_threads = consumer_config.get("webhook_threads", 20)
-        self.max_empty_polls = consumer_config.get("max_empty_polls", 10)
-        
-        # Track statistics
-        self.stats = {
-            "messages_processed": 0,
-            "successful_deliveries": 0,
-            "failed_deliveries": 0,
-            "retries": 0,
-            "circuit_breaks": 0,
-            "start_time": time.time()
-        }
-        
-        # Flag for shutdown
-        self.running = True
-        
-        # Start health check server
-        self.start_health_server()
-        
-        # Check Redis Sentinel status
-        sentinel_status = check_sentinel_health(self.config)
-        if sentinel_status["status"] == "ok":
-            logger.info(f"Redis Sentinel active: Master at {sentinel_status.get('master')}, {sentinel_status.get('slave_count')} slaves")
-        else:
-            logger.warning(f"Redis Sentinel not available: {sentinel_status.get('error')}")
-    
-    def log_with_context(self, level, message, **extra):
-        """Log with the current request context."""
-        
-        # Call the appropriate logger method with context as extra
-        if level == "debug":
-            logger.debug(message, **extra)
-        elif level == "info":
-            logger.info(message, **extra)
-        elif level == "warning":
-            logger.warning(message, **extra)
-        elif level == "error":
-            logger.error(message, **extra)
-        elif level == "critical":
-            logger.critical(message, **extra)
-
-    def deliver_webhook(self, message):
-        """Send a notification to the bucket-specific webhook with OAuth authentication."""
-        start_time = time.time()
-        bucket_name = message.get("bucket", "unknown")
-        object_key = message.get("key", "unknown")
-        event_type = message.get("event_type", "unknown")
-        request_id = message.get("request_id", "unknown")
-        retry_count = message.get("retry_count", 0)
-        
-        context = {
-            "request_id": request_id,
-            "bucket": bucket_name,
-            "object_key": object_key,
-            "event_type": event_type,
-            "retry_count": retry_count
-        }
-        
-        # Look up the bucket configuration
-        bucket_config = get_bucket_config(self.redis_client, bucket_name)
-        if not bucket_config:
-            # Fallback to in-memory config
-            bucket_config = next((b for b in self.config.get("buckets", []) if b["name"] == bucket_name), None)
-        
-        if not bucket_config or "webhook_url" not in bucket_config:
-            self.log_with_context("error", f"No webhook URL configured", **context)
-            return False
-        
-        webhook_url = bucket_config["webhook_url"]
-        self.log_with_context("debug", f"Preparing webhook request", 
-                            webhook_url=webhook_url, **context)
-        
-        # Check circuit breaker
-        if webhook_url not in self.circuit_breakers:
-            webhook_config = self.config.get("webhook", {})
-            self.circuit_breakers[webhook_url] = CircuitBreaker(
-                failure_threshold=webhook_config.get("circuit_threshold", 5),
-                reset_timeout=webhook_config.get("circuit_reset_time", 60)
-            )
-        
-        circuit_breaker = self.circuit_breakers[webhook_url]
-        
-        if not circuit_breaker.allow_request():
-            self.log_with_context("warning", f"Circuit breaker open, skipping webhook request", 
-                                webhook_url=webhook_url, **context)
-            self.stats["circuit_breaks"] += 1
-            return False
-        
-        # Add delivery timestamp
-        message["delivery_attempt_time"] = datetime.now().isoformat()
-        
-        # Set up headers
-        headers = {
-            "Content-Type": "application/json",
-            "X-Bucket-Name": bucket_name,
-            "X-Event-Type": message.get("event_type", "unknown"),
-            "X-Request-ID": request_id
-        }
-        
-        # Check for webhook authentication
-        if "webhook_auth" in bucket_config and bucket_config["webhook_auth"].get("type") == "oauth2":
-            auth_config = bucket_config["webhook_auth"]
-            client_id = auth_config.get("client_id")
-            client_secret = auth_config.get("client_secret")
-            token_url = auth_config.get("token_url")
-
-            self.log_with_context("debug", f"OAuth auth configured", 
-                                webhook_url=webhook_url, token_url=token_url, **context)
-            
-            if client_id and client_secret and token_url:
-                self.log_with_context("debug", f"Requesting OAuth token from {token_url} for client ID {client_id}", **context)
-
-                try:
-                    auth_str = f"{client_id}:{client_secret}"
-                    auth_bytes = auth_str.encode('ascii')
-                    base64_bytes = base64.b64encode(auth_bytes)
-                    base64_auth = base64_bytes.decode('ascii')
-                    
-                    headers_token_request = {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Authorization": f"Basic {base64_auth}"
-                    }
-                    
-                    data_token_request = {
-                        "grant_type": "client_credentials"
-                    }
-                    
-                    self.log_with_context("debug", f"Making token request to {token_url}", **context)
-                    
-                    token_response = requests.post(
-                        token_url, 
-                        headers=headers_token_request, 
-                        data=data_token_request,
-                        timeout=self.timeout
-                    )
-                    
-                    self.log_with_context("info", f"Token response status", 
-                                        status_code=token_response.status_code, **context)
-
-                    if token_response.status_code == 200:
-                        token_data = token_response.json()
-                        self.log_with_context("debug", f"Token response data keys", 
-                                            keys=list(token_data.keys()), **context)
-                        
-                        access_token = token_data.get("access_token")
-
-                        if access_token:
-                            token_length = len(access_token)
-                            token_stripped = access_token.strip()
-                            stripped_length = len(token_stripped)
-                            
-                            if token_length != stripped_length:
-                                self.log_with_context("warning", f"Token contains whitespace!", 
-                                                original_length=token_length, 
-                                                stripped_length=stripped_length,
-                                                first_chars=access_token[:5], 
-                                                last_chars=access_token[-5:], **context)
-                                # Use the stripped token instead
-                                access_token = token_stripped
-                        
-                        self.log_with_context("info", f"Received access token", token_prefix=access_token[:5], **context)
-                        
-                        # Try uppercase "Bearer" as in curl
-                        headers["Authorization"] = f"Bearer {access_token}" 
-                        
-                        # Check for whitespace in the full Authorization header
-                        auth_header = headers["Authorization"]
-                        auth_header_stripped = auth_header.strip()
-                        if len(auth_header) != len(auth_header_stripped):
-                            self.log_with_context("warning", f"Authorization header contains whitespace!", 
-                                            original=auth_header, 
-                                            stripped=auth_header_stripped, **context)
-                            # Use the stripped header
-                            headers["Authorization"] = auth_header_stripped
-                        
-                        self.log_with_context("debug", f"Added Authorization header", 
-                                            auth_header=headers["Authorization"], **context)
-                        
-                    else:
-                        self.log_with_context("error", f"Token request failed", 
-                                            status_code=token_response.status_code, 
-                                            response=token_response.text, **context)
-                except Exception as e:
-                    self.log_with_context("error", f"Exception during token request", 
-                                        error_type=type(e).__name__,
-                                        error=str(e), **context)
-
-        # Log the final headers and message
-        self.log_with_context("debug", f"Final webhook request headers", 
-                            headers=headers, **context)
-        self.log_with_context("debug", f"Webhook request payload", 
-                            payload=json.dumps(message)[:200], **context)
-        
+    # Create formatters
+    if use_json:
         try:
-            # Send to webhook
-            self.log_with_context("info", f"Sending webhook request", 
-                                webhook_url=webhook_url, **context)
+            class JsonFormatter(logging.Formatter):
+                def format(self, record):
+                    log_record = {
+                        "timestamp": self.formatTime(record, self.datefmt),
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "message": record.getMessage(),
+                    }
+                    
+                    # Add extra fields if present
+                    for attr, value in record.__dict__.items():
+                        if attr not in ('args', 'asctime', 'created', 'exc_info', 'exc_text', 'filename',
+                                    'funcName', 'id', 'levelname', 'levelno', 'lineno', 'module',
+                                    'msecs', 'message', 'msg', 'name', 'pathname', 'process',
+                                    'processName', 'relativeCreated', 'stack_info', 'thread', 'threadName'):
+                            log_record[attr] = value
+                    
+                    if record.exc_info:
+                        log_record["exception"] = self.formatException(record.exc_info)
+                        
+                    return json.dumps(log_record)
             
-            response = requests.post(
-                webhook_url,
-                json=message,
-                headers=headers,
-                timeout=self.timeout
+            formatter = JsonFormatter()
+        except ImportError:
+            _default_logger.warning("python-json-logger not found, using default formatter")
+
+    else:
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # Add file handler if LOG_FILE is specified
+    log_file = os.environ.get("LOG_FILE")
+    if log_file:
+        try:
+            # Create directory if it doesn't exist
+            log_dir = os.path.dirname(log_file)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir)
+            
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logger.info(f"Logging to file: {log_file}")
+        except Exception as e:
+            logger.error(f"Failed to set up file logging: {e}")
+    
+    return logger
+
+# Load and merge configurations
+def load_config():
+    """Load configuration from files and environment variables."""
+    # Base configuration from configmap
+    config_path = os.environ.get("CONFIG_PATH", "/app/config/config.yaml")
+    config = {}
+    
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                _default_logger.info(f"Loaded base configuration from {config_path}")
+    except Exception as e:
+        _default_logger.error(f"Error loading configuration from {config_path}: {e}")
+    
+    # Load bucket configurations from secrets
+    buckets_path = os.environ.get("BUCKETS_PATH", "/app/secrets/buckets.yaml")
+    try:
+        if os.path.exists(buckets_path):
+            with open(buckets_path, 'r') as f:
+                buckets_config = yaml.safe_load(f)
+                if buckets_config and "buckets" in buckets_config:
+                    config["buckets"] = buckets_config["buckets"]
+                    _default_logger.info(f"Loaded {len(config['buckets'])} buckets from {buckets_path}")
+    except Exception as e:
+        _default_logger.error(f"Error loading buckets from {buckets_path}: {e}")
+    
+    # Override with environment variables
+    if "POLLING_INTERVAL" in os.environ:
+        try:
+            interval = int(os.environ["POLLING_INTERVAL"])
+            if "defaults" not in config:
+                config["defaults"] = {}
+            config["defaults"]["polling_interval"] = interval
+            _default_logger.info(f"Overriding polling interval to {interval}s from environment")
+        except ValueError:
+            _default_logger.error(f"Invalid POLLING_INTERVAL value: {os.environ['POLLING_INTERVAL']}")
+    
+    if "REDIS_HOST" in os.environ:
+        if "redis" not in config:
+            config["redis"] = {}
+        config["redis"]["host"] = os.environ["REDIS_HOST"]
+    
+    if "WEBHOOK_URL" in os.environ:
+        if "webhook" not in config:
+            config["webhook"] = {}
+        config["webhook"]["url"] = os.environ["WEBHOOK_URL"]
+    
+    return config
+
+# Redis client creation
+def create_redis_client(config):
+    """Create Redis clients with Sentinel support for HA."""
+    redis_config = config.get("redis", {})
+    
+    # Get Sentinel configuration
+    sentinel_host = redis_config.get("sentinel_host", "redis-sentinel")
+    sentinel_port = redis_config.get("sentinel_port", 26379)
+    master_name = redis_config.get("master_name", "mymaster")
+    password = redis_config.get("password", None)
+    db = redis_config.get("db", 0)
+    
+    # Set up connection pools for better performance
+    socket_timeout = 5.0
+    socket_connect_timeout = 5.0
+    
+    try:
+        # Create Sentinel manager
+        sentinel = Sentinel(
+            [(sentinel_host, sentinel_port)],
+            socket_timeout=socket_timeout,
+            password=password
+        )
+        
+        # Create Redis clients - one for master (writes), one for slave (reads)
+        master = sentinel.master_for(
+            master_name,
+            socket_timeout=socket_timeout,
+            db=db,
+            password=password,
+            decode_responses=True
+        )
+        
+        slave = sentinel.slave_for(
+            master_name,
+            socket_timeout=socket_timeout,
+            db=db,
+            password=password,
+            decode_responses=True
+        )
+        
+        _default_logger.info("Successfully connected to Redis via Sentinel")
+        
+        # Return both clients
+        return {
+            "master": master,  # Use for writes
+            "slave": slave     # Use for reads
+        }
+    except Exception as e:
+        _default_logger.error(f"Error connecting to Redis via Sentinel: {e}")
+        
+        # Fallback to direct connection if Sentinel fails
+        _default_logger.warning("Falling back to direct Redis connection")
+        try:
+            # Try to connect directly to Redis master as fallback
+            fallback_host = redis_config.get("host", "redis-0.redis")
+            fallback_port = redis_config.get("port", 6379)
+            
+            redis_client = redis.Redis(
+                host=fallback_host,
+                port=fallback_port,
+                db=db,
+                password=password,
+                decode_responses=True,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout
             )
             
-            duration_ms = int((time.time() - start_time) * 1000)
-            self.log_with_context("info", f"Webhook response received", 
-                                response_code=response.status_code,
-                                duration_ms=duration_ms, 
-                                response_body=response.text[:200], **context)
+            # Simple connection test
+            redis_client.ping()
             
-            if response.status_code >= 200 and response.status_code < 300:
-                self.log_with_context("info", f"Successfully delivered notification", **context)
-                circuit_breaker.record_success()
-                return True
-            else:
-                self.log_with_context("warning", f"Webhook returned error", 
-                                    response_code=response.status_code,
-                                    response_body=response.text[:200], **context)
-                
-                # Clear token cache if authentication error
-                if (response.status_code == 401 or response.status_code == 403) and "webhook_auth" in bucket_config:
-                    auth_config = bucket_config["webhook_auth"]
-                    client_id = auth_config.get("client_id")
-                    token_url = auth_config.get("token_url")
-                    
-                    if client_id and token_url:
-                        clear_oauth_token_cache(client_id, token_url)
-                        self.log_with_context("info", f"Cleared OAuth token due to authentication error", 
-                                            client_id=client_id, **context)
-                
-                circuit_breaker.record_failure()
-                return False
-                
-        except requests.exceptions.RequestException as e:
-            self.log_with_context("warning", f"Request to webhook failed", 
-                                error=str(e), webhook_url=webhook_url, **context)
-            circuit_breaker.record_failure()
-            return False
+            # Return the same client for both reads and writes in fallback mode
+            return {
+                "master": redis_client,
+                "slave": redis_client
+            }
+        except Exception as fallback_error:
+            _default_logger.error(f"Fallback Redis connection also failed: {fallback_error}")
+            raise
+
+# OAuth token cache
+oauth_token_cache = {}
+
+# Default OAuth token URL (same for all webhooks)
+#DEFAULT_OAUTH_TOKEN_URL = "https://oauth/token"
+
+def get_oauth_token(client_id, client_secret, token_url):
+    """Get OAuth token using client credentials grant.
     
-    def process_message(self, message):
-        """Process a message and send to webhook with retries."""
-
-        if "request_id" not in message:
-            message["request_id"] = str(uuid.uuid4())
+    Args:
+        client_id: OAuth client ID
+        client_secret: OAuth client secret
+        token_url: OAuth token endpoint URL
         
-        request_id = message["request_id"]
-        retry_count = message.get("retry_count", 0)
-        message["retry_count"] = retry_count + 1
-
-        bucket = message.get("bucket", "unknown")
-        object_key = message.get("key", "unknown")
-        event_type = message.get("event_type", "unknown")
-
-        context = {
-            "request_id": request_id,
-            "bucket": bucket,
-            "object_key": object_key,
-            "event_type": event_type, 
-            "retry_count": retry_count
+    Returns:
+        str: OAuth access token or None if failed
+    """
+    if not token_url:
+        _default_logger.error("No token URL provided for OAuth authentication")
+        return None
+        
+    cache_key = f"{client_id}:{token_url}"
+    
+    # Check cache first
+    current_time = time.time()
+    if cache_key in oauth_token_cache:
+        token_data = oauth_token_cache[cache_key]
+        # Check if token is still valid (with 5-minute buffer)
+        if current_time < token_data["expires_at"] - 300:  # 5-minute buffer
+            _default_logger.debug(f"Using cached OAuth token for {client_id}")
+            return token_data["access_token"]
+    
+    try:
+        # Prepare Basic Auth header
+        auth_str = f"{client_id}:{client_secret}"
+        auth_bytes = auth_str.encode('ascii')
+        base64_bytes = base64.b64encode(auth_bytes)
+        base64_auth = base64_bytes.decode('ascii')
+        
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {base64_auth}"
         }
-
-
-        self.log_with_context("info", f"Processing webhook delivery", **context)
         
-        # Attempt delivery
-        success = self.deliver_webhook(message)
+        data = {
+            "grant_type": "client_credentials"
+        }
         
-        if success:
-            self.stats["successful_deliveries"] += 1
-            return True
-        else:
-            self.stats["failed_deliveries"] += 1
-
-            message["retry_count"] = retry_count + 1
+        _default_logger.debug(f"Requesting OAuth token from {token_url}")
+        response = requests.post(token_url, headers=headers, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            access_token = token_data.get("access_token")
+            expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
             
-            # Check if we should retry
-            if retry_count < self.max_retries:
-                # Calculate backoff time
-                backoff = (self.backoff_factor ** retry_count) + random.random()
-                
-                self.log_with_context("info", f"Will retry message after {backoff:.2f}s", 
-                                   backoff_seconds=backoff, **context)
-                  
-                # Sleep for backoff period
-                time.sleep(backoff)
-                self.stats["retries"] += 1
-                
-                # Retry
-                return self.process_message(message)
-            else:
-                # Max retries exceeded
-                self.log_with_context("error", f"Max retries exceeded", **context)
-                return False
+            # Cache the token with expiration time
+            oauth_token_cache[cache_key] = {
+                "access_token": access_token,
+                "expires_at": current_time + expires_in
+            }
+            
+            _default_logger.info(f"Successfully obtained OAuth token for {client_id}")
+            return access_token
+        else:
+            _default_logger.error(f"Failed to obtain OAuth token: {response.status_code}, {response.text}")
+            return None
+            
+    except Exception as e:
+        _default_logger.error(f"Error obtaining OAuth token for {client_id}: {e}")
+        return None
+
+def clear_oauth_token_cache(client_id=None, token_url=None):
+    """Clear OAuth token cache for specific client or all clients."""
+    global oauth_token_cache
     
-    def process_batch(self):
-        """Process a batch of messages from the queue."""
-        messages = get_notifications(self.redis_client, self.config, self.batch_size)
+    if client_id and token_url:
+        cache_key = f"{client_id}:{token_url}"
+        if cache_key in oauth_token_cache:
+            del oauth_token_cache[cache_key]
+            _default_logger.debug(f"Cleared OAuth token cache for {client_id} and {token_url}")
+    else:
+        oauth_token_cache = {}
+        _default_logger.debug("Cleared all OAuth token cache")
+
+# Get webhook URL for a specific bucket
+def get_bucket_webhook_url(redis_client, config, bucket_name):
+    """Get the webhook URL for a specific bucket."""
+    # Check if we have a bucket-specific webhook URL in Redis
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Try to get from Redis first (for dynamic updates)
+    webhook_url = client.get(f"linode:objstore:config:{bucket_name}:webhook_url")
+    
+    # If not in Redis, check bucket configs
+    if not webhook_url:
+        for bucket in config.get("buckets", []):
+            if bucket["name"] == bucket_name:
+                webhook_url = bucket.get("webhook_url")
+                if webhook_url:
+                    break
+    
+    return webhook_url
+
+# JWT Authentication functions
+def generate_jwt_token(client_id, expiry_hours=24):
+    """Generate a JWT token for the given client_id."""
+    now = datetime.utcnow()
+    payload = {
+        'sub': client_id,
+        'iat': now,
+        'exp': now + timedelta(hours=expiry_hours)
+    }
+    
+    jwt_secret = os.environ.get('JWT_SECRET', 'default-secret-key')
+    token = jwt.encode(payload, jwt_secret, algorithm='HS256')
+    
+    # PyJWT > 2.0.0 returns string instead of bytes
+    if isinstance(token, bytes):
+        return token.decode('utf-8')
+    return token
+
+def validate_jwt_token(token):
+    """Validate a JWT token and return the payload if valid."""
+    jwt_secret = os.environ.get('JWT_SECRET', 'default-secret-key')
+    try:
+        payload = jwt.decode(token, jwt_secret, algorithms=['HS256'])
+        return payload
+    except jwt.ExpiredSignatureError:
+        _default_logger.warning("JWT token expired")
+        return None
+    except jwt.InvalidTokenError as e:
+        _default_logger.warning(f"Invalid JWT token: {e}")
+        return None
+
+def validate_client_credentials(client_id, client_secret):
+    """Validate client credentials against configured values."""
+    expected_client_id = os.environ.get('API_CLIENT_ID', 'default-client-id')
+    expected_client_secret = os.environ.get('API_CLIENT_SECRET', 'default-client-secret')
+    
+    return client_id == expected_client_id and client_secret == expected_client_secret
+
+
+# Bucket notification status functions
+def is_bucket_notifications_enabled(redis_client, bucket_name):
+    """Check if notifications are enabled for a bucket."""
+    # Use slave for reads when available
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    result = client.get(f"linode:objstore:config:{bucket_name}:notifications_disabled")
+    return result is None  # Enabled if not explicitly disabled
+    
+def disable_bucket_notifications(redis_client, bucket_name):
+    """Disable notifications for a bucket."""
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    client.set(f"linode:objstore:config:{bucket_name}:notifications_disabled", "true")
+    _default_logger.info(f"Notifications disabled for bucket {bucket_name}")
+    
+def enable_bucket_notifications(redis_client, bucket_name):
+    """Enable notifications for a bucket."""
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    client.delete(f"linode:objstore:config:{bucket_name}:notifications_disabled")
+    _default_logger.info(f"Notifications enabled for bucket {bucket_name}")
+
+def add_bucket_info_to_redis(redis_client, bucket_info):
+    """Store bucket information in Redis for administrative review."""
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Create a Redis key based on bucket name
+    redis_key = f"linode:objstore:pending_buckets:{bucket_info['name']}"
+    
+    # Store the full information as JSON
+    client.set(redis_key, json.dumps(bucket_info))
+    
+    # Set a TTL (e.g., 7 days) so pending configs don't stay forever
+    client.expire(redis_key, 7 * 24 * 60 * 60)
+    
+    return True
+
+def get_pending_bucket_configs(redis_client):
+    """Get all pending bucket configurations from Redis."""
+    # Use slave for reads
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Get all pending bucket keys
+    pending_keys = client.keys("linode:objstore:pending_buckets:*")
+    
+    # Get the information for each key
+    pending_buckets = []
+    for key in pending_keys:
+        data = client.get(key)
+        if data:
+            try:
+                bucket_info = json.loads(data)
+                pending_buckets.append(bucket_info)
+            except json.JSONDecodeError:
+                continue
+                
+    return pending_buckets
+
+# State management functions
+def get_object_state(redis_client, config, bucket, key):
+    """Get stored state for an object."""
+    state_prefix = config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
+    redis_key = f"{state_prefix}{bucket}:{key}"
+    
+    # Use slave for reads if available, otherwise use what we have
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    try:
+        state_json = client.get(redis_key)
+        if state_json:
+            try:
+                return json.loads(state_json)
+            except json.JSONDecodeError:
+                _default_logger.error(f"Invalid JSON in Redis for {redis_key}")
+    except redis.RedisError as e:
+        _default_logger.error(f"Redis error getting state for {redis_key}: {e}")
+        
+    return None
+
+def save_object_state(redis_client, config, bucket, key, state):
+    """Save state for an object with TTL."""
+    state_prefix = config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
+    redis_key = f"{state_prefix}{bucket}:{key}"
+    
+    # Get TTL from config or use default (30 days)
+    ttl = config.get("redis", {}).get("ttl", 2592000)
+    
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    try:
+        # Set with expiration to prevent unlimited growth
+        client.setex(redis_key, ttl, json.dumps(state))
+        return True
+    except Exception as e:
+        _default_logger.error(f"Error saving state to Redis for {redis_key}: {e}")
+        return False
+
+# Queue operations
+def publish_notification(redis_client, config, message):
+    """Publish a notification to the Redis queue."""
+    queue_name = config.get("redis", {}).get("queue_name", "linode:notifications:queue")
+    
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    try:
+        # Convert message to JSON string
+        message_json = json.dumps(message)
+        
+        # Push to Redis list used as queue
+        client.rpush(queue_name, message_json)
+        
+        # Optional: Set TTL on queue to prevent unbounded growth
+        client.expire(queue_name, 604800)  # 7 days
+        
+        return True
+    except Exception as e:
+        _default_logger.error(f"Error publishing to queue: {e}")
+        return False
+
+def get_notifications(redis_client, config, batch_size=10):
+    """Get a batch of notifications from the Redis queue with atomic operations."""
+    queue_name = config.get("redis", {}).get("queue_name", "linode:notifications:queue")
+    
+    # Use master for queue operations (atomic LRANGE+LTRIM)
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Create a pipeline to execute commands atomically
+    pipe = client.pipeline()
+    pipe.lrange(queue_name, 0, batch_size - 1)
+    pipe.ltrim(queue_name, batch_size, -1)
+    
+    try:
+        # Execute both commands atomically
+        result = pipe.execute()
+        messages = result[0]
         
         if not messages:
-            return 0
-        
-        batch_id = str(uuid.uuid4())
-        self.log_with_context("info", f"Processing batch of {len(messages)} messages", 
-                             batch_size=len(messages), batch_id=batch_id)
-        
-        # Use thread pool to process messages in parallel
-        with ThreadPoolExecutor(max_workers=self.webhook_threads) as executor:
-            # Submit tasks
-            futures = [executor.submit(self.process_message, message) for message in messages]
+            return []
             
-            # Wait for all to complete
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    self.log_with_context("error", f"Error processing message: {e}", 
-                                         error=str(e), error_type=type(e).__name__)
-        
-        # Update statistics
-        self.stats["messages_processed"] += len(messages)
-        
-        self.log_with_context("info", f"Completed batch processing", 
-                             batch_size=len(messages), batch_id=batch_id)
-        return len(messages)
-    
-    def start_health_server(self):
-        """Start a simple HTTP server for health checks."""
-        class HealthHandler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self2, *args, **kwargs):
-                self2.consumer = self
-                super().__init__(*args, **kwargs)
-                
-            def do_GET(self2):
-                if self2.path == '/health':
-                    # Basic health check
-                    health_status = {"status": "ok"}
-                    self2.send_response(200)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps(health_status).encode())
-                    
-                elif self2.path == '/ready':
-                    # Check if Redis is available, Sentinel is available, and webhook URL is configured
-                    redis_ok = check_redis_health(self.redis_client)
-                    sentinel_ok = check_sentinel_health(self.config)["status"] == "ok"
-                    
-                    # For webhook readiness, check if we have buckets with webhook URLs
-                    webhook_ok = any(bucket.get("webhook_url") for bucket in self.config.get("buckets", []))
-                    
-                    status_code = 200 if (redis_ok and webhook_ok and sentinel_ok) else 503
-                    ready_status = {
-                        "status": "ready" if (redis_ok and webhook_ok and sentinel_ok) else "not_ready",
-                        "redis": "ok" if redis_ok else "error",
-                        "sentinel": "ok" if sentinel_ok else "error",
-                        "webhook": "ok" if webhook_ok else "missing"
-                    }
-                    self2.send_response(status_code)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps(ready_status).encode())
-                    
-                elif self2.path == '/metrics':
-                    # Return current metrics
-                    uptime = time.time() - self.stats["start_time"]
-                    queue_stats = check_queue_stats(self.redis_client, self.config)
-                    sentinel_stats = check_sentinel_health(self.config)
-                    
-                    # Add circuit breaker stats per webhook
-                    circuit_stats = {}
-                    for webhook_url, circuit in self.circuit_breakers.items():
-                        circuit_stats[webhook_url] = {
-                            "state": circuit.state,
-                            "failures": circuit.failures
-                        }
-                    
-                    metrics = {
-                        "consumer_stats": self.stats,
-                        "queue": queue_stats,
-                        "sentinel": sentinel_stats,
-                        "uptime_seconds": uptime,
-                        "circuit_breakers": circuit_stats
-                    }
-                    
-                    self2.send_response(200)
-                    self2.send_header('Content-Type', 'application/json')
-                    self2.end_headers()
-                    self2.wfile.write(json.dumps(metrics).encode())
-                    
-                else:
-                    self2.send_response(404)
-                    self2.end_headers()
-                    
-            def log_message(self2, format, *args):
-                # Suppress logs from the HTTP server
-                pass
-        
-        def start_server():
-            httpd = socketserver.ThreadingTCPServer(('', 8080), HealthHandler)
-            httpd.serve_forever()
-            
-        # Start in a separate thread
-        server_thread = threading.Thread(target=start_server, daemon=True)
-        server_thread.start()
-        logger.info("Health check server started on port 8080")
-    
-    def run(self):
-        """Run the consumer in a continuous loop."""
-        logger.info("Starting webhook consumer for bucket-specific webhook delivery")
-        
-        empty_polls = 0
-        last_stats_time = time.time()
-        
-        while self.running:
+        # Parse JSON messages
+        parsed_messages = []
+        for message_json in messages:
             try:
-                # Process a batch
-                processed = self.process_batch()
+                parsed_messages.append(json.loads(message_json))
+            except json.JSONDecodeError:
+                _default_logger.error(f"Invalid JSON in queue message: {message_json[:100]}...")
+                continue
                 
-                if processed == 0:
-                    empty_polls += 1
-                    # Exponential backoff for empty polls to reduce Redis load
-                    sleep_time = min(
-                        self.polling_interval * (2 if empty_polls > self.max_empty_polls else 1),
-                        5  # Cap at 5 seconds
-                    )
-                    time.sleep(sleep_time)
-                else:
-                    empty_polls = 0
-                    # Brief pause to prevent CPU spinning
-                    time.sleep(0.1)
-                
-                # Log stats periodically (every minute)
-                if time.time() - last_stats_time > 60:
-                    self.log_with_context("info", 
-                        f"Statistics: processed {self.stats['messages_processed']}, "
-                        f"success {self.stats['successful_deliveries']}, "
-                        f"failed {self.stats['failed_deliveries']}, "
-                        f"retries {self.stats['retries']}, "
-                        f"circuit breaks {self.stats['circuit_breaks']}",
-                        stats=self.stats
-                    )
-                        
-                    last_stats_time = time.time()
-                    
-                    # Also check sentinel status periodically
-                    sentinel_status = check_sentinel_health(self.config)
-                    if sentinel_status["status"] == "ok":
-                        self.log_with_context("debug", f"Redis Sentinel active", slave_count=sentinel_status.get('slave_count'))
-                    else:
-                        self.log_with_context("warning", f"Redis Sentinel issue detected", error=sentinel_status.get('error'))
-                    
-            except KeyboardInterrupt:
-                logger.info("Consumer stopped by user")
-                self.running = False
-                break
-            except Exception as e:
-                self.log_with_context("error", f"Error in consumer main loop: {e}", 
-                                     error=str(e), error_type=type(e).__name__)
-                # Don't crash, sleep and retry
-                time.sleep(5)
-        
-        logger.info("Consumer shutting down")
+        return parsed_messages
+    except Exception as e:
+        _default_logger.error(f"Error getting notifications from queue: {e}")
+        return []
 
-if __name__ == "__main__":
-    consumer = WebhookConsumer()
-    consumer.run()
+# Health check functions
+def check_redis_health(redis_client):
+    """Check if Redis is healthy."""
+    try:
+        # Check both master and slave if available
+        if isinstance(redis_client, dict):
+            master_ok = redis_client["master"].ping()
+            slave_ok = redis_client["slave"].ping()
+            return master_ok and slave_ok
+        else:
+            return redis_client.ping()
+    except Exception as e:
+        _default_logger.error(f"Redis health check failed: {e}")
+        return False
+
+def check_sentinel_health(config):
+    """Check Sentinel status."""
+    redis_config = config.get("redis", {})
+    sentinel_host = redis_config.get("sentinel_host", "redis-sentinel")
+    sentinel_port = redis_config.get("sentinel_port", 26379)
+    master_name = redis_config.get("master_name", "mymaster")
+    
+    try:
+        # Connect to Sentinel
+        sentinel = Sentinel(
+            [(sentinel_host, sentinel_port)],
+            socket_timeout=1.0
+        )
+        
+        # Get master address
+        master = sentinel.discover_master(master_name)
+        
+        # Get slave addresses
+        slaves = sentinel.discover_slaves(master_name)
+        
+        return {
+            "status": "ok",
+            "master": f"{master[0]}:{master[1]}",
+            "slaves": [f"{slave[0]}:{slave[1]}" for slave in slaves],
+            "slave_count": len(slaves)
+        }
+    except Exception as e:
+        _default_logger.error(f"Sentinel health check failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+def check_queue_stats(redis_client, config):
+    """Get statistics about the notification queue."""
+    queue_name = config.get("redis", {}).get("queue_name", "linode:notifications:queue")
+    
+    # Use slave for reads when possible
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    try:
+        queue_length = client.llen(queue_name)
+        return {
+            "queue_length": queue_length,
+            "queue_name": queue_name
+        }
+    except Exception as e:
+        _default_logger.error(f"Error getting queue stats: {e}")
+        return {"error": str(e)}
+    
+# Functions for storing configuration (NO TTL)
+def save_bucket_config(redis_client, bucket_config):
+    """Save bucket configuration to Redis with NO TTL."""
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    bucket_name = bucket_config["name"]
+    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+    
+    # Store as JSON without TTL
+    client.set(redis_key, json.dumps(bucket_config))
+    _default_logger.info(f"Saved bucket configuration for {bucket_name} to Redis (persistent)")
+    return True
+
+def get_bucket_config(redis_client, bucket_name):
+    """Get bucket configuration from Redis."""
+    # Use slave for reads when available
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+    config_json = client.get(redis_key)
+    
+    if config_json:
+        try:
+            return json.loads(config_json)
+        except json.JSONDecodeError:
+            _default_logger.error(f"Invalid JSON in Redis for {redis_key}")
+    
+    return None
+
+def load_bucket_configs(redis_client):
+    """Load all bucket configurations from Redis."""
+    # Use slave for reads when available
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    # Get all bucket configurations
+    bucket_keys = client.keys("linode:objstore:config:bucket:*")
+    bucket_configs = []
+    
+    for key in bucket_keys:
+        config_json = client.get(key)
+        if config_json:
+            try:
+                bucket_config = json.loads(config_json)
+                bucket_configs.append(bucket_config)
+            except json.JSONDecodeError:
+                _default_logger.error(f"Invalid JSON in Redis for {key}")
+    
+    return bucket_configs
+
+# Functions for object state WITH TTL
+def save_object_state(redis_client, config, bucket, key, state):
+    """Save state for an object with TTL."""
+    state_prefix = config.get("redis", {}).get("state_prefix", "linode:objstore:state:")
+    redis_key = f"{state_prefix}{bucket}:{key}"
+    
+    # Get TTL from config or use default (30 days)
+    ttl = config.get("redis", {}).get("ttl", 2592000)
+    
+    # Use master for writes
+    client = redis_client.get("master", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    try:
+        # Set with expiration to prevent unlimited growth
+        client.setex(redis_key, ttl, json.dumps(state))
+        return True
+    except Exception as e:
+        _default_logger.error(f"Error saving state to Redis for {redis_key}: {e}")
+        return False
+    
+def get_bucket_credentials_from_infisical(bucket_name: str) -> Optional[Dict[str, str]]:
+    """Retrieve bucket credentials from Infisical"""
+    global _infisical_cache
+    
+    # Check cache first
+    cache_key = f"{bucket_name}:{INFISICAL_ENV}"
+    if cache_key in _infisical_cache:
+        cached_data, cache_time = _infisical_cache[cache_key]
+        if time.time() - cache_time < _cache_ttl:
+            return cached_data
+    
+    if not INFISICAL_TOKEN or not INFISICAL_PROJECT_ID:
+        _default_logger.error("Infisical credentials not configured")
+        return None
+    
+    try:
+        # Get both access and secret keys
+        headers = {
+            "Authorization": f"Bearer {INFISICAL_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        credentials = {}
+        
+        # Retrieve access key
+        access_key_name = f"{bucket_name.upper().replace('-', '_')}_ACCESS_KEY"
+        url = f"{INFISICAL_API_URL}/api/v3/secrets/raw/{access_key_name}"
+        params = {
+            "workspaceId": INFISICAL_PROJECT_ID,
+            "environment": INFISICAL_ENV,
+            "secretPath": "/"
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            credentials['access_key'] = data.get('secret', {}).get('secretValue')
+        
+        # Retrieve secret key
+        secret_key_name = f"{bucket_name.upper().replace('-', '_')}_SECRET_KEY"
+        url = f"{INFISICAL_API_URL}/api/v3/secrets/raw/{secret_key_name}"
+        
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            credentials['secret_key'] = data.get('secret', {}).get('secretValue')
+        
+        if credentials.get('access_key') and credentials.get('secret_key'):
+            # Cache the credentials
+            _infisical_cache[cache_key] = (credentials, time.time())
+            return credentials
+        else:
+            _default_logger.error(f"Failed to retrieve complete credentials for bucket {bucket_name}")
+            return None
+            
+    except Exception as e:
+        _default_logger.error(f"Error retrieving credentials from Infisical: {e}")
+        return None
+
+def get_bucket_config(redis_client, bucket_name):
+    """Get bucket configuration from Redis, but fetch credentials from Infisical"""
+    # Get base config from Redis
+    client = redis_client.get("slave", redis_client) if isinstance(redis_client, dict) else redis_client
+    
+    redis_key = f"linode:objstore:config:bucket:{bucket_name}"
+    config_json = client.get(redis_key)
+    
+    if config_json:
+        try:
+            bucket_config = json.loads(config_json)
+            
+            # Override credentials with Infisical values
+            infisical_creds = get_bucket_credentials_from_infisical(bucket_name)
+            if infisical_creds:
+                bucket_config['access_key'] = infisical_creds['access_key']
+                bucket_config['secret_key'] = infisical_creds['secret_key']
+                _default_logger.debug(f"Using credentials from Infisical for bucket {bucket_name}")
+            else:
+                _default_logger.warning(f"Failed to get Infisical credentials for {bucket_name}, using Redis fallback")
+            
+            return bucket_config
+        except json.JSONDecodeError:
+            _default_logger.error(f"Invalid JSON in Redis for {redis_key}")
+    
+    return None
