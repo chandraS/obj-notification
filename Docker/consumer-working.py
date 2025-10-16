@@ -4,7 +4,7 @@ Webhook Consumer for Linode Object Storage Monitor
 
 This script reads notifications from the Redis queue and
 delivers them to the configured webhook endpoint.
-It handles retries, circuit breaking, and rate limiting.
+It implements fail-fast pattern with health tracking instead of circuit breakers.
 
 Supports Redis Sentinel for high availability.
 """
@@ -62,53 +62,102 @@ class ContextLogger:
 logger = ContextLogger(base_logger)
 
 
-class CircuitBreaker:
-    """Circuit breaker pattern implementation for webhook endpoints."""
+class WebhookHealthTracker:
+    """Tracks webhook health and implements fail-fast pattern."""
     
-    def __init__(self, failure_threshold=5, reset_timeout=60):
-        """Initialize the circuit breaker."""
-        self.failure_threshold = failure_threshold
-        self.reset_timeout = reset_timeout
-        self.failures = 0
-        self.last_failure_time = 0
-        self.state = "closed"  # closed, open, half-open
+    def __init__(self, config):
+        """Initialize health tracker with configuration."""
+        webhook_config = config.get("webhook", {})
+        self.consecutive_failure_threshold = webhook_config.get("consecutive_failure_threshold", 5)
+        self.max_backoff_time = webhook_config.get("max_backoff_time", 300)
+        self.base_backoff_time = webhook_config.get("base_backoff_time", 30)
+        self.health_reset_interval = webhook_config.get("health_reset_interval", 3600)  # 1 hour
+        
+        self.webhook_health = {}
         self.lock = threading.Lock()
     
-    def allow_request(self):
-        """Check if a request should be allowed based on circuit state."""
-        with self.lock:
-            if self.state == "closed":
-                return True
-            elif self.state == "open":
-                # Check if it's time to try again
-                if time.time() - self.last_failure_time > self.reset_timeout:
-                    logger.debug("Circuit half-open, allowing test request")
-                    self.state = "half-open"
-                    return True
-                return False
-            elif self.state == "half-open":
-                return True
+    def should_count_as_health_failure(self, response_code):
+        """Determine if response code should affect webhook health."""
+        # Don't count client errors (4xx) as health issues
+        # Only server errors (5xx) and timeouts affect health
+        return response_code >= 500
     
-    def record_success(self):
-        """Record a successful request."""
+    def is_webhook_healthy(self, webhook_url, retry_count=0):
+        """Check if webhook is healthy enough for retry attempts."""
+        # First attempts are always allowed
+        if retry_count == 0:
+            return True
+        
         with self.lock:
-            if self.state == "half-open":
-                logger.info("Circuit closed after successful test request")
-                self.state = "closed"
-            self.failures = 0
-    
-    def record_failure(self):
-        """Record a failed request."""
-        with self.lock:
-            self.failures += 1
-            self.last_failure_time = time.time()
+            health = self.webhook_health.get(webhook_url, {
+                'consecutive_failures': 0,
+                'last_success': time.time(),
+                'last_failure': 0
+            })
             
-            if self.state == "half-open" or (self.state == "closed" and self.failures >= self.failure_threshold):
-                logger.warning(f"Circuit opened after {self.failures} failures")
-                self.state = "open"
+            # Periodic health reset for stuck states
+            if health['last_failure'] > 0 and time.time() - health['last_failure'] > self.health_reset_interval:
+                health['consecutive_failures'] = 0
+                self.webhook_health[webhook_url] = health
+                logger.info(f"Reset health for webhook due to timeout", webhook_url=webhook_url)
+            
+            # Check if webhook has too many consecutive failures
+            if health['consecutive_failures'] >= self.consecutive_failure_threshold:
+                # Calculate exponential backoff
+                failures_over_threshold = health['consecutive_failures'] - self.consecutive_failure_threshold + 1
+                backoff_time = min(
+                    self.max_backoff_time,
+                    self.base_backoff_time * (2 ** (failures_over_threshold - 1))
+                )
+                
+                # Check if enough time has passed for retry
+                if time.time() - health['last_failure'] < backoff_time:
+                    return False
+            
+            return True
+    
+    def record_success(self, webhook_url):
+        """Record successful webhook delivery."""
+        with self.lock:
+            self.webhook_health[webhook_url] = {
+                'consecutive_failures': 0,
+                'last_success': time.time(),
+                'last_failure': self.webhook_health.get(webhook_url, {}).get('last_failure', 0)
+            }
+    
+    def record_failure(self, webhook_url, response_code=None):
+        """Record failed webhook delivery."""
+        # Only count certain failures as health issues
+        if response_code and not self.should_count_as_health_failure(response_code):
+            return
+        
+        with self.lock:
+            health = self.webhook_health.get(webhook_url, {
+                'consecutive_failures': 0,
+                'last_success': 0,
+                'last_failure': 0
+            })
+            
+            health['consecutive_failures'] += 1
+            health['last_failure'] = time.time()
+            self.webhook_health[webhook_url] = health
+    
+    def get_health_stats(self):
+        """Get health statistics for all webhooks."""
+        with self.lock:
+            stats = {}
+            for webhook_url, health in self.webhook_health.items():
+                stats[webhook_url] = {
+                    'consecutive_failures': health['consecutive_failures'],
+                    'is_healthy': health['consecutive_failures'] < self.consecutive_failure_threshold,
+                    'last_success_age': time.time() - health['last_success'] if health['last_success'] > 0 else None,
+                    'last_failure_age': time.time() - health['last_failure'] if health['last_failure'] > 0 else None
+                }
+            return stats
+
 
 class WebhookConsumer:
-    """Consumer that processes queue messages and delivers to webhooks."""
+    """Consumer that processes queue messages and delivers to webhooks with fail-fast pattern."""
     
     def __init__(self):
         """Initialize the consumer with configuration."""
@@ -121,8 +170,8 @@ class WebhookConsumer:
         self.max_retries = webhook_config.get("max_retries", 3)
         self.backoff_factor = webhook_config.get("backoff_factor", 2)
         
-        # Create circuit breakers dictionary (one per webhook URL)
-        self.circuit_breakers = {}
+        # Initialize health tracker
+        self.health_tracker = WebhookHealthTracker(self.config)
         
         # Configure consumer settings
         consumer_config = self.config.get("consumer", {})
@@ -131,15 +180,23 @@ class WebhookConsumer:
         self.webhook_threads = consumer_config.get("webhook_threads", 20)
         self.max_empty_polls = consumer_config.get("max_empty_polls", 10)
         
+        # Configure adaptive timeout
+        self.adaptive_timeout_enabled = webhook_config.get("adaptive_timeout_enabled", True)
+        self.min_timeout = webhook_config.get("min_timeout", 2)
+        self.failure_rate_threshold = webhook_config.get("failure_rate_threshold", 0.5)
+        
         # Track statistics
         self.stats = {
             "messages_processed": 0,
             "successful_deliveries": 0,
             "failed_deliveries": 0,
             "retries": 0,
-            "circuit_breaks": 0,
+            "retries_skipped": 0,
             "start_time": time.time()
         }
+        
+        # Track failure rates for adaptive timeout
+        self.failure_rate_window = {}
         
         # Flag for shutdown
         self.running = True
@@ -154,10 +211,49 @@ class WebhookConsumer:
         else:
             logger.warning(f"Redis Sentinel not available: {sentinel_status.get('error')}")
     
+    def get_adaptive_timeout(self, webhook_url):
+        """Calculate timeout based on recent failure rate for this webhook."""
+        if not self.adaptive_timeout_enabled:
+            return self.timeout
+        
+        # Get recent failures for this webhook
+        failure_data = self.failure_rate_window.get(webhook_url, {
+            'failures': 0,
+            'attempts': 0,
+            'window_start': time.time()
+        })
+        
+        # Reset window every 5 minutes
+        if time.time() - failure_data['window_start'] > 300:
+            failure_data = {'failures': 0, 'attempts': 0, 'window_start': time.time()}
+            self.failure_rate_window[webhook_url] = failure_data
+        
+        failure_rate = failure_data['failures'] / max(failure_data['attempts'], 1)
+        
+        # Reduce timeout for failing webhooks
+        if failure_rate > 0.8:  # 80% failure rate
+            return self.min_timeout
+        elif failure_rate > self.failure_rate_threshold:
+            return max(self.min_timeout, self.timeout // 2)
+        else:
+            return self.timeout
+    
+    def update_failure_rate(self, webhook_url, success):
+        """Update failure rate tracking for adaptive timeout."""
+        failure_data = self.failure_rate_window.get(webhook_url, {
+            'failures': 0,
+            'attempts': 0,
+            'window_start': time.time()
+        })
+        
+        failure_data['attempts'] += 1
+        if not success:
+            failure_data['failures'] += 1
+        
+        self.failure_rate_window[webhook_url] = failure_data
+    
     def log_with_context(self, level, message, **extra):
         """Log with the current request context."""
-        
-        # Call the appropriate logger method with context as extra
         if level == "debug":
             logger.debug(message, **extra)
         elif level == "info":
@@ -170,7 +266,7 @@ class WebhookConsumer:
             logger.critical(message, **extra)
 
     def deliver_webhook(self, message):
-        """Send a notification to the bucket-specific webhook with OAuth authentication."""
+        """Send a notification to the bucket-specific webhook with fail-fast health checking."""
         start_time = time.time()
         bucket_name = message.get("bucket", "unknown")
         object_key = message.get("key", "unknown")
@@ -200,26 +296,24 @@ class WebhookConsumer:
         self.log_with_context("debug", f"Preparing webhook request", 
                             webhook_url=webhook_url, **context)
         
-        # Check circuit breaker
-        if webhook_url not in self.circuit_breakers:
-            webhook_config = self.config.get("webhook", {})
-            self.circuit_breakers[webhook_url] = CircuitBreaker(
-                failure_threshold=webhook_config.get("circuit_threshold", 5),
-                reset_timeout=webhook_config.get("circuit_reset_time", 60)
-            )
-        
-        circuit_breaker = self.circuit_breakers[webhook_url]
-        
-        if not circuit_breaker.allow_request():
-            self.log_with_context("warning", f"Circuit breaker open, skipping webhook request", 
+        # Check webhook health for retry attempts
+        if not self.health_tracker.is_webhook_healthy(webhook_url, retry_count):
+            self.log_with_context("warning", f"Skipping retry to unhealthy webhook", 
                                 webhook_url=webhook_url, **context)
-            self.stats["circuit_breaks"] += 1
+            self.stats["retries_skipped"] += 1
             return False
+        
+        if retry_count > 0:
+            health_stats = self.health_tracker.get_health_stats().get(webhook_url, {})
+            self.log_with_context("info", f"Retry attempt to webhook", 
+                                webhook_url=webhook_url, 
+                                consecutive_failures=health_stats.get('consecutive_failures', 0),
+                                **context)
         
         # Add delivery timestamp
         message["delivery_attempt_time"] = datetime.now().isoformat()
         
-        # Set up headers
+        # Set up fresh headers for each attempt
         headers = {
             "Content-Type": "application/json",
             "X-Bucket-Name": bucket_name,
@@ -285,12 +379,10 @@ class WebhookConsumer:
                                                 stripped_length=stripped_length,
                                                 first_chars=access_token[:5], 
                                                 last_chars=access_token[-5:], **context)
-                                # Use the stripped token instead
                                 access_token = token_stripped
                         
                         self.log_with_context("info", f"Received access token", token_prefix=access_token[:5], **context)
                         
-                        # Try uppercase "Bearer" as in curl
                         headers["Authorization"] = f"Bearer {access_token}" 
                         
                         # Check for whitespace in the full Authorization header
@@ -300,7 +392,6 @@ class WebhookConsumer:
                             self.log_with_context("warning", f"Authorization header contains whitespace!", 
                                             original=auth_header, 
                                             stripped=auth_header_stripped, **context)
-                            # Use the stripped header
                             headers["Authorization"] = auth_header_stripped
                         
                         self.log_with_context("debug", f"Added Authorization header", 
@@ -321,16 +412,19 @@ class WebhookConsumer:
         self.log_with_context("debug", f"Webhook request payload", 
                             payload=json.dumps(message)[:200], **context)
         
+        # Get adaptive timeout
+        adaptive_timeout = self.get_adaptive_timeout(webhook_url)
+        
         try:
             # Send to webhook
             self.log_with_context("info", f"Sending webhook request", 
-                                webhook_url=webhook_url, **context)
+                                webhook_url=webhook_url, timeout=adaptive_timeout, **context)
             
             response = requests.post(
                 webhook_url,
                 json=message,
                 headers=headers,
-                timeout=self.timeout
+                timeout=adaptive_timeout
             )
             
             duration_ms = int((time.time() - start_time) * 1000)
@@ -339,14 +433,21 @@ class WebhookConsumer:
                                 duration_ms=duration_ms, 
                                 response_body=response.text[:200], **context)
             
-            if response.status_code >= 200 and response.status_code < 300:
+            # Update failure rate tracking
+            success = response.status_code >= 200 and response.status_code < 300
+            self.update_failure_rate(webhook_url, success)
+            
+            if success:
                 self.log_with_context("info", f"Successfully delivered notification", **context)
-                circuit_breaker.record_success()
+                self.health_tracker.record_success(webhook_url)
                 return True
             else:
                 self.log_with_context("warning", f"Webhook returned error", 
                                     response_code=response.status_code,
                                     response_body=response.text[:200], **context)
+                
+                # Record health failure
+                self.health_tracker.record_failure(webhook_url, response.status_code)
                 
                 # Clear token cache if authentication error
                 if (response.status_code == 401 or response.status_code == 403) and "webhook_auth" in bucket_config:
@@ -359,13 +460,15 @@ class WebhookConsumer:
                         self.log_with_context("info", f"Cleared OAuth token due to authentication error", 
                                             client_id=client_id, **context)
                 
-                circuit_breaker.record_failure()
                 return False
                 
         except requests.exceptions.RequestException as e:
             self.log_with_context("warning", f"Request to webhook failed", 
                                 error=str(e), webhook_url=webhook_url, **context)
-            circuit_breaker.record_failure()
+            
+            # Update failure rate and health tracking
+            self.update_failure_rate(webhook_url, False)
+            self.health_tracker.record_failure(webhook_url)
             return False
     
     def process_message(self, message):
@@ -390,7 +493,6 @@ class WebhookConsumer:
             "retry_count": retry_count
         }
 
-
         self.log_with_context("info", f"Processing webhook delivery", **context)
         
         # Attempt delivery
@@ -401,7 +503,6 @@ class WebhookConsumer:
             return True
         else:
             self.stats["failed_deliveries"] += 1
-
             message["retry_count"] = retry_count + 1
             
             # Check if we should retry
@@ -496,20 +597,23 @@ class WebhookConsumer:
                     queue_stats = check_queue_stats(self.redis_client, self.config)
                     sentinel_stats = check_sentinel_health(self.config)
                     
-                    # Add circuit breaker stats per webhook
-                    circuit_stats = {}
-                    for webhook_url, circuit in self.circuit_breakers.items():
-                        circuit_stats[webhook_url] = {
-                            "state": circuit.state,
-                            "failures": circuit.failures
-                        }
+                    # Add webhook health stats
+                    webhook_health_stats = self.health_tracker.get_health_stats()
                     
                     metrics = {
                         "consumer_stats": self.stats,
                         "queue": queue_stats,
                         "sentinel": sentinel_stats,
                         "uptime_seconds": uptime,
-                        "circuit_breakers": circuit_stats
+                        "webhook_health": webhook_health_stats,
+                        "failure_rate_windows": {
+                            url: {
+                                "failure_rate": data["failures"] / max(data["attempts"], 1),
+                                "attempts": data["attempts"],
+                                "failures": data["failures"]
+                            }
+                            for url, data in self.failure_rate_window.items()
+                        }
                     }
                     
                     self2.send_response(200)
@@ -536,7 +640,7 @@ class WebhookConsumer:
     
     def run(self):
         """Run the consumer in a continuous loop."""
-        logger.info("Starting webhook consumer for bucket-specific webhook delivery")
+        logger.info("Starting webhook consumer with fail-fast health tracking")
         
         empty_polls = 0
         last_stats_time = time.time()
@@ -561,13 +665,18 @@ class WebhookConsumer:
                 
                 # Log stats periodically (every minute)
                 if time.time() - last_stats_time > 60:
+                    health_stats = self.health_tracker.get_health_stats()
+                    unhealthy_webhooks = [url for url, stats in health_stats.items() if not stats['is_healthy']]
+                    
                     self.log_with_context("info", 
                         f"Statistics: processed {self.stats['messages_processed']}, "
                         f"success {self.stats['successful_deliveries']}, "
                         f"failed {self.stats['failed_deliveries']}, "
                         f"retries {self.stats['retries']}, "
-                        f"circuit breaks {self.stats['circuit_breaks']}",
-                        stats=self.stats
+                        f"retries_skipped {self.stats['retries_skipped']}, "
+                        f"unhealthy_webhooks {len(unhealthy_webhooks)}",
+                        stats=self.stats,
+                        unhealthy_webhooks=unhealthy_webhooks
                     )
                         
                     last_stats_time = time.time()
