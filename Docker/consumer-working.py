@@ -4,7 +4,6 @@ Webhook Consumer for Linode Object Storage Monitor
 
 This script reads notifications from the Redis queue and
 delivers them to the configured webhook endpoint.
-It implements fail-fast pattern with health tracking instead of circuit breakers.
 
 Supports Redis Sentinel for high availability.
 """
