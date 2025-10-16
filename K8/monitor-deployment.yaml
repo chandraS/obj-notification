@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: bucket-monitor
-        image: shicha/bucket-monitor:update-config-auth-webhook-auth-v1  # Replace with your image
+        image: shicha/bucket-monitor:update-config-auth-webhook-auth-v7  # Replace with your image
         imagePullPolicy: Always
         resources:
           requests:
@@ -48,10 +48,24 @@ spec:
             secretKeyRef:
               name: api-auth-secrets
               key: client-secret
+        - name: INFISICAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: infisical-credentials
+              key: token
+        - name: INFISICAL_PROJECT_ID
+          valueFrom:
+            secretKeyRef:
+              name: infisical-credentials
+              key: project-id
         - name: REDIS_HOST
           value: "redis"
         - name: LOG_LEVEL
           value: "INFO"
+        - name: INFISICAL_API_URL
+          value: "https://hmsinfvault.akamai-mco.com"
+        - name: INFISICAL_ENV
+          value: "dev"
         volumeMounts:
         - name: config-volume
           mountPath: /app/config
