@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
       - name: webhook-consumer
-        image: shicha/bucket-consumer:update-config-auth-webhook-auth-logging  # Updated image tag
+        image: shicha/bucket-consumer:update-config-auth-webhook-auth-logging-v2  # Updated image tag
         imagePullPolicy: Always
         resources:
           requests:
@@ -31,10 +31,24 @@ spec:
             cpu: "4"
             memory: "8Gi"
         env:
+        - name: INFISICAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: infisical-credentials
+              key: token
+        - name: INFISICAL_PROJECT_ID
+          valueFrom:
+            secretKeyRef:
+              name: infisical-credentials
+              key: project-id
         - name: REDIS_HOST
           value: "redis"
         - name: LOG_LEVEL
           value: "INFO"
+        - name: INFISICAL_API_URL
+          value: "https://hmsinfvault.akamai-mco.com"
+        - name: INFISICAL_ENV
+          value: "dev"
         - name: LOG_FORMAT_JSON
           value: "true"  # Enable JSON formatting
         - name: LOG_FILE
